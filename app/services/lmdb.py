@@ -1,5 +1,4 @@
 import hashlib
-import re
 import string
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -13,6 +12,7 @@ from loguru import logger
 from app.models import ContentItem, ConversationInStore, Message
 from app.utils import g_config
 from app.utils.helper import (
+    THINK_TAGS_RE,
     extract_tool_calls,
     normalize_llm_text,
     remove_tool_call_blocks,
@@ -589,7 +589,7 @@ class LMDBConversationStore(metaclass=Singleton):
         """Remove all <think>...</think> tags and strip whitespace."""
         if not text:
             return text
-        cleaned_content = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        cleaned_content = THINK_TAGS_RE.sub("", text)
         return cleaned_content.strip()
 
     @staticmethod
