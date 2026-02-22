@@ -5,6 +5,7 @@ description = "FastAPI Server built on Gemini Web API"
 readme = "README.md"
 requires-python = "==3.13.*"
 dependencies = [
+    "curl-cffi>=0.14.0",
     "fastapi>=0.129.2",
     "gemini-webapi>=1.19.2",
     "httptools>=0.7.1",
