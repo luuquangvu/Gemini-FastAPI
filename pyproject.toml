@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.129.2",
     "gemini-webapi>=1.19.2",
     "httptools>=0.7.1",
+    "httpx[http2]>=0.28.1",
     "lmdb>=1.7.5",
     "loguru>=0.7.3",
     "orjson>=3.11.7",
