@@ -164,12 +164,12 @@ def _strip_param_fences(s: str) -> str:
     if not match or not s.endswith(match.group("fence")):
         return s
 
+    fence = match.group("fence")
     lines = s.splitlines()
-    if len(lines) >= 2:
+    if len(lines) >= 3 and lines[-1].strip() == fence:
         return "\n".join(lines[1:-1])
 
-    n = len(match.group("fence"))
-    return s[n:-n].strip()
+    return s[len(fence) : -len(fence)].strip()
 
 
 def estimate_tokens(text: str | None) -> int:
