@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import hashlib
 import io
 import re
@@ -1024,6 +1025,77 @@ async def _restream(
         yield chunk
 
 
+STREAM_HEARTBEAT_INTERVAL = 5.0
+INPUT_PREPROCESS_TIMEOUT_SECONDS = min(float(g_config.gemini.timeout), 60.0)
+
+
+def _trace_id_from_headers(headers: Any) -> str:
+    """Trace id for per-request tracing: x-obp-request-id -> x-request-id -> \"-\"."""
+    for name in ("x-obp-request-id", "x-request-id"):
+        if value := headers.get(name):
+            return value
+    return "-"
+
+
+async def _process_conversation_with_timeout(msgs: list[AppMessage], tmp_dir: Path) -> tuple:
+    """Run the input preprocess pipeline under a hard time bound (<=60s)."""
+    return await asyncio.wait_for(
+        GeminiClientWrapper.process_conversation(msgs, tmp_dir),
+        timeout=INPUT_PREPROCESS_TIMEOUT_SECONDS,
+    )
+
+
+async def _stream_with_idle_timeout(
+    generator: AsyncGenerator[ModelOutput],
+    timeout_seconds: float,
+) -> AsyncGenerator[ModelOutput | None]:
+    """Iterate a chunk stream with a per-chunk deadline and idle heartbeats.
+
+    Chunks are yielded unchanged. When no chunk arrives within
+    STREAM_HEARTBEAT_INTERVAL seconds, yields None (the heartbeat sentinel -
+    callers translate it to an SSE comment, never a data event). Raises
+    asyncio.TimeoutError if a single chunk is stalled past timeout_seconds
+    (the deadline resets per chunk), handing the failure to the caller's
+    recovery path.
+    """
+    loop = asyncio.get_running_loop()
+    next_task: asyncio.Task | None = None
+    try:
+        while True:
+            deadline = loop.time() + timeout_seconds
+            remaining = timeout_seconds
+            while remaining > 0:
+                if next_task is None:
+                    next_task = asyncio.create_task(anext(generator))
+                done, _ = await asyncio.wait(
+                    {next_task},
+                    timeout=min(STREAM_HEARTBEAT_INTERVAL, remaining),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if done:
+                    try:
+                        chunk = next_task.result()
+                    except StopAsyncIteration:
+                        return
+                    next_task = None
+                    yield chunk
+                    break
+                remaining = deadline - loop.time()
+                yield None
+            else:
+                raise TimeoutError(
+                    f"stream chunk stalled past {timeout_seconds:.0f}s (per-chunk timeout)"
+                )
+    finally:
+        if next_task is not None and not next_task.done():
+            next_task.cancel()
+        if next_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await next_task
+        with contextlib.suppress(Exception):
+            await generator.aclose()
+
+
 async def _send_and_await_first_chunk(
     session: ChatSession,
     text: str,
@@ -1095,9 +1167,19 @@ async def _send_with_internal_fallback(
         )
         fallback_client = await pool.acquire()
         fallback_session = fallback_client.start_chat(model=model)
-        fallback_input, fallback_files = await GeminiClientWrapper.process_conversation(
-            full_prepared_messages, tmp_dir
-        )
+        try:
+            fallback_input, fallback_files = await _process_conversation_with_timeout(
+                full_prepared_messages, tmp_dir
+            )
+        except TimeoutError:
+            logger.warning(
+                f"Input preprocessing timed out after {INPUT_PREPROCESS_TIMEOUT_SECONDS:.0f}s "
+                "during metadata-replay fallback."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Input preprocessing timed out.",
+            ) from None
         # Keep the caller's streaming mode: the endpoints reject a ModelOutput when the client
         # asked for a stream, so downgrading here would turn a recovery into a 502.
         output = await _send_and_await_first_chunk(
@@ -1302,6 +1384,9 @@ def _create_real_streaming_response(
         all_outputs: list[ModelOutput] = []
         suppressor = StreamingOutputFilter()
         prev_rcid = getattr(session, "rcid", "") or ""
+        t0 = time.monotonic()
+        logged_first_chunk = False
+        logged_first_text = False
 
         media_tasks = []
         seen_media_urls = set()
@@ -1326,9 +1411,19 @@ def _create_real_streaming_response(
             else:
                 generator = _make_async_gen(cast(ModelOutput, resp_or_stream))
 
+            generator = _stream_with_idle_timeout(generator, float(g_config.gemini.timeout))
+
             async for chunk in generator:
+                if chunk is None:
+                    yield ": ping\n\n"
+                    continue
                 all_outputs.append(chunk)
                 if not has_started:
+                    if not logged_first_chunk:
+                        logger.info(
+                            f"First upstream chunk after {(time.monotonic() - t0) * 1000:.0f} ms"
+                        )
+                        logged_first_chunk = True
                     yield make_chunk(
                         {"delta": {"role": "assistant", "content": ""}, "finish_reason": None}
                     )
@@ -1341,6 +1436,11 @@ def _create_real_streaming_response(
                     )
 
                 if text_delta := chunk.text_delta:
+                    if not logged_first_text:
+                        logger.info(
+                            f"First text delta after {(time.monotonic() - t0) * 1000:.0f} ms"
+                        )
+                        logged_first_text = True
                     full_text += text_delta
                     if not structured_requirement and (
                         visible_delta := suppressor.process(text_delta)
@@ -1361,7 +1461,9 @@ def _create_real_streaming_response(
                         seen_media_urls.add(p_url)
                         media_tasks.append(asyncio.create_task(_process_media_item(m)))
         except Exception as e:
-            logger.error(f"Error during streaming: {e}")
+            logger.error(
+                f"Error during streaming after {(time.monotonic() - t0) * 1000:.0f} ms: {e}"
+            )
             if not structured_requirement and (remainder := suppressor.flush()):
                 yield make_chunk({"delta": {"content": remainder}, "finish_reason": None})
             recovered = await _recover_stream_output(
@@ -1545,6 +1647,7 @@ def _create_real_streaming_response(
             }
         )
         yield "data: [DONE]\n\n"
+        logger.info(f"Stream finished after {(time.monotonic() - t0) * 1000:.0f} ms")
 
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
@@ -1638,6 +1741,9 @@ def _create_responses_real_streaming_response(
         message_index = 0
         suppressor = StreamingOutputFilter()
         prev_rcid = getattr(session, "rcid", "") or ""
+        t0 = time.monotonic()
+        logged_first_chunk = False
+        logged_first_text = False
 
         try:
             if hasattr(resp_or_stream, "__aiter__"):
@@ -1649,8 +1755,19 @@ def _create_responses_real_streaming_response(
 
                 generator = _make_async_gen(cast(ModelOutput, resp_or_stream))
 
+            generator = _stream_with_idle_timeout(generator, float(g_config.gemini.timeout))
+
             async for chunk in generator:
+                if chunk is None:
+                    yield ": ping\n\n"
+                    continue
                 all_outputs.append(chunk)
+                if not logged_first_chunk:
+                    logger.info(
+                        f"First upstream chunk after {(time.monotonic() - t0) * 1000:.0f} ms "
+                        f"(responses)"
+                    )
+                    logged_first_chunk = True
 
                 if chunk.thoughts_delta:
                     if not thought_open:
@@ -1700,6 +1817,12 @@ def _create_responses_real_streaming_response(
                     )
 
                 if chunk.text_delta:
+                    if not logged_first_text:
+                        logger.info(
+                            f"First text delta after {(time.monotonic() - t0) * 1000:.0f} ms "
+                            f"(responses)"
+                        )
+                        logged_first_text = True
                     full_text += chunk.text_delta
                     if thought_open:
                         yield make_event(
@@ -1806,7 +1929,9 @@ def _create_responses_real_streaming_response(
                         media_tasks.append(asyncio.create_task(_process_media_item(m)))
 
         except Exception as e:
-            logger.error(f"Error during streaming: {e}")
+            logger.error(
+                f"Error during streaming after {(time.monotonic() - t0) * 1000:.0f} ms: {e}"
+            )
             remaining = "" if structured_requirement else suppressor.flush()
             if remaining and message_open:
                 yield make_event(
@@ -2481,6 +2606,7 @@ def _create_responses_real_streaming_response(
         )
 
         yield "data: [DONE]\n\n"
+        logger.info(f"Responses stream finished after {(time.monotonic() - t0) * 1000:.0f} ms")
 
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
@@ -2536,6 +2662,13 @@ async def create_chat_completion(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Messages required.")
 
     app_messages = convert_to_app_messages(request.messages)
+
+    trace_id = _trace_id_from_headers(raw_request.headers)
+    prompt_chars = sum(len(str(m.content)) for m in app_messages if m.content)
+    logger.info(
+        f"Request accepted: trace={trace_id} model={request.model} "
+        f"stream={bool(request.stream)} prompt_chars={prompt_chars}"
+    )
 
     if request.deep_research:
         if request.stream:
@@ -2654,7 +2787,17 @@ async def create_chat_completion(
             extra_instr,
             False,
         )
-        m_input, files = await GeminiClientWrapper.process_conversation(input_msgs, tmp_dir)
+        try:
+            m_input, files = await _process_conversation_with_timeout(input_msgs, tmp_dir)
+        except TimeoutError:
+            logger.warning(
+                f"Input preprocessing timed out after {INPUT_PREPROCESS_TIMEOUT_SECONDS:.0f}s "
+                f"(reused session)."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Input preprocessing timed out.",
+            ) from None
 
         logger.debug(
             f"Reused session {reprlib.repr(session.metadata)} - sending {len(input_msgs)} prepared messages."
@@ -2663,7 +2806,7 @@ async def create_chat_completion(
         try:
             client = await pool.acquire()
             session = client.start_chat(model=model)
-            m_input, files = await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
+            m_input, files = await _process_conversation_with_timeout(msgs, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
             raise HTTPException(
@@ -2866,6 +3009,12 @@ async def create_response(
 ):
     base_url = str(raw_request.base_url)
     base_messages = _convert_responses_to_app_messages(request.input)
+    trace_id = _trace_id_from_headers(raw_request.headers)
+    prompt_chars = sum(len(str(m.content)) for m in base_messages if m.content)
+    logger.info(
+        f"Request accepted: trace={trace_id} model={request.model} "
+        f"stream={bool(request.stream)} prompt_chars={prompt_chars}"
+    )
     structured_requirement = _build_structured_requirement(request.response_format)
     extra_instr = [structured_requirement.instruction] if structured_requirement else []
 
@@ -2932,7 +3081,17 @@ async def create_response(
         )
         if not msgs:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No new messages.")
-        m_input, files = await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
+        try:
+            m_input, files = await _process_conversation_with_timeout(msgs, tmp_dir)
+        except TimeoutError:
+            logger.warning(
+                f"Input preprocessing timed out after {INPUT_PREPROCESS_TIMEOUT_SECONDS:.0f}s "
+                "(reused session)."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Input preprocessing timed out.",
+            ) from None
         logger.debug(
             f"Reused session {reprlib.repr(session.metadata)} - sending {len(msgs)} prepared messages."
         )
@@ -2940,7 +3099,7 @@ async def create_response(
         try:
             client = await pool.acquire()
             session = client.start_chat(model=model)
-            m_input, files = await GeminiClientWrapper.process_conversation(messages, tmp_dir)
+            m_input, files = await _process_conversation_with_timeout(messages, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
             raise HTTPException(
