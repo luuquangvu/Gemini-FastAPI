@@ -68,7 +68,12 @@ from app.server.middleware import (
 )
 from app.services import GeminiClientPool, GeminiClientWrapper, LMDBConversationStore
 from app.utils import g_config
-from app.utils.config import ChatMode, get_reloaded_models, reload_models_if_changed
+from app.utils.config import (
+    ChatMode,
+    OversizedContextStrategy,
+    get_reloaded_models,
+    reload_models_if_changed,
+)
 from app.utils.helper import (
     STREAM_MASTER_RE,
     STREAM_TAIL_RE,
@@ -88,12 +93,22 @@ from app.utils.helper import (
     serialize_tool_choice_for_response,
     serialize_tools_for_response,
     strip_system_hints,
+    text_from_message,
 )
 
 MAX_CHARS_PER_REQUEST = int(g_config.gemini.max_chars_per_request * 0.9)
 # Google's temporary chat mode accepts a smaller payload than a normal chat, so tighten
 # the guardrail further on top of the standard 10% safety margin.
 TEMPORARY_MAX_CHARS_PER_REQUEST = int(MAX_CHARS_PER_REQUEST * 0.9)
+SUMMARY_KEEP_LAST_MESSAGES = 8
+SUMMARY_MAX_LINES = 24
+SUMMARY_MAX_LINE_CHARS = 320
+SUMMARY_MAX_TOTAL_CHARS = 6000
+COMPACTED_SUMMARY_PROMPT = (
+    "Conversation summary for older turns (compacted to stay within provider limits):\n"
+    "{summary}\n"
+    "Use this as context continuity for earlier turns."
+)
 
 router = APIRouter()
 _AVAILABLE_MODELS_CACHE: list[ModelData] | None = None
@@ -955,6 +970,93 @@ def _effective_max_chars_per_request(temporary: bool) -> int:
     return TEMPORARY_MAX_CHARS_PER_REQUEST if temporary else MAX_CHARS_PER_REQUEST
 
 
+def _build_history_summary_message(messages: list[AppMessage]) -> AppMessage | None:
+    """Create a compact summary message for older turns to reduce oversized replay payloads."""
+    if not messages:
+        return None
+
+    summary_lines: list[str] = []
+    used_chars = 0
+    for msg in messages:
+        if len(summary_lines) >= SUMMARY_MAX_LINES or used_chars >= SUMMARY_MAX_TOTAL_CHARS:
+            break
+
+        raw = text_from_message(msg).replace("\n", " ").strip()
+        if not raw and not msg.tool_calls:
+            continue
+
+        if msg.tool_calls:
+            raw = f"{raw} [tool_calls={len(msg.tool_calls)}]".strip()
+
+        if len(raw) > SUMMARY_MAX_LINE_CHARS:
+            raw = f"{raw[: SUMMARY_MAX_LINE_CHARS - 3]}..."
+
+        line = f"- {msg.role}: {raw}"
+        used_chars += len(line)
+        summary_lines.append(line)
+
+    if not summary_lines:
+        return None
+
+    summary_text = COMPACTED_SUMMARY_PROMPT.format(summary="\n".join(summary_lines))
+    return AppMessage(role="system", content=summary_text)
+
+
+def _compact_messages_with_summary(messages: list[AppMessage]) -> list[AppMessage]:
+    """Keep recent turns verbatim and compact older turns into one summary message."""
+    if len(messages) <= SUMMARY_KEEP_LAST_MESSAGES:
+        return messages
+
+    older = messages[:-SUMMARY_KEEP_LAST_MESSAGES]
+    recent = messages[-SUMMARY_KEEP_LAST_MESSAGES:]
+    summary_msg = _build_history_summary_message(older)
+    if not summary_msg:
+        return messages
+
+    compacted: list[AppMessage] = []
+    if messages and messages[0].role == "system":
+        first = messages[0].model_copy(deep=True)
+        if isinstance(first.content, str):
+            first.content = (
+                f"{first.content}\n\n{summary_msg.content}"
+                if first.content
+                else str(summary_msg.content)
+            )
+            compacted.append(first)
+        else:
+            compacted.append(summary_msg)
+    else:
+        compacted.append(summary_msg)
+
+    compacted.extend(recent)
+    return compacted
+
+
+async def _process_conversation_with_compaction(
+    messages: list[AppMessage],
+    tmp_dir: Path,
+    allow_summary_compaction: bool,
+    reason: str,
+) -> tuple[str, list[str | Path | bytes | io.BytesIO]]:
+    """Build conversation payload and optionally compact oversized histories."""
+    model_input, files = await GeminiClientWrapper.process_conversation(messages, tmp_dir)
+    effective_limit = _effective_max_chars_per_request(_use_temporary_chat_mode())
+    if len(model_input) <= effective_limit or not allow_summary_compaction:
+        return model_input, files
+
+    compacted = _compact_messages_with_summary(messages)
+    if compacted == messages:
+        return model_input, files
+
+    compacted_input, compacted_files = await GeminiClientWrapper.process_conversation(
+        compacted, tmp_dir
+    )
+    logger.warning(
+        f"Input too large for {reason} ({len(model_input)}>{effective_limit}); compacted history to {len(compacted_input)} chars before send."
+    )
+    return compacted_input, compacted_files
+
+
 async def _send_with_split(
     session: ChatSession,
     text: str,
@@ -1037,10 +1139,31 @@ def _trace_id_from_headers(headers: Any) -> str:
     return "-"
 
 
-async def _process_conversation_with_timeout(msgs: list[AppMessage], tmp_dir: Path) -> tuple:
-    """Run the input preprocess pipeline under a hard time bound (<=60s)."""
+async def _process_conversation_with_timeout(
+    msgs: list[AppMessage],
+    tmp_dir: Path,
+    allow_summary_compaction: bool | None = None,
+    reason: str | None = None,
+) -> tuple:
+    """Run the input preprocess pipeline under a hard time bound (<=60s).
+
+    Composes the C7 summary-compaction behavior: when allow_summary_compaction
+    is set, oversized histories are compacted (last-8 verbatim + bounded summary)
+    before sending — both passes bounded by the same hard timeout.
+    """
+
+    async def _run() -> tuple:
+        if allow_summary_compaction is None:
+            return await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
+        return await _process_conversation_with_compaction(
+            msgs,
+            tmp_dir,
+            allow_summary_compaction=allow_summary_compaction,
+            reason=reason or "preprocessed conversation",
+        )
+
     return await asyncio.wait_for(
-        GeminiClientWrapper.process_conversation(msgs, tmp_dir),
+        _run(),
         timeout=INPUT_PREPROCESS_TIMEOUT_SECONDS,
     )
 
@@ -1169,7 +1292,13 @@ async def _send_with_internal_fallback(
         fallback_session = fallback_client.start_chat(model=model)
         try:
             fallback_input, fallback_files = await _process_conversation_with_timeout(
-                full_prepared_messages, tmp_dir
+                full_prepared_messages,
+                tmp_dir,
+                allow_summary_compaction=(
+                    g_config.gemini.oversized_context_strategy
+                    == OversizedContextStrategy.COMPACTION
+                ),
+                reason="fallback replay",
             )
         except TimeoutError:
             logger.warning(
@@ -2788,7 +2917,16 @@ async def create_chat_completion(
             False,
         )
         try:
-            m_input, files = await _process_conversation_with_timeout(input_msgs, tmp_dir)
+            m_input, files = await _process_conversation_with_timeout(
+                input_msgs,
+                tmp_dir,
+                allow_summary_compaction=(
+                    use_temporary
+                    and g_config.gemini.oversized_context_strategy
+                    == OversizedContextStrategy.COMPACTION
+                ),
+                reason="temporary session replay",
+            )
         except TimeoutError:
             logger.warning(
                 f"Input preprocessing timed out after {INPUT_PREPROCESS_TIMEOUT_SECONDS:.0f}s "
@@ -2806,7 +2944,16 @@ async def create_chat_completion(
         try:
             client = await pool.acquire()
             session = client.start_chat(model=model)
-            m_input, files = await _process_conversation_with_timeout(msgs, tmp_dir)
+            m_input, files = await _process_conversation_with_timeout(
+                msgs,
+                tmp_dir,
+                allow_summary_compaction=(
+                    use_temporary
+                    and g_config.gemini.oversized_context_strategy
+                    == OversizedContextStrategy.COMPACTION
+                ),
+                reason="temporary fresh replay",
+            )
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
             raise HTTPException(
@@ -3082,7 +3229,16 @@ async def create_response(
         if not msgs:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No new messages.")
         try:
-            m_input, files = await _process_conversation_with_timeout(msgs, tmp_dir)
+            m_input, files = await _process_conversation_with_timeout(
+                msgs,
+                tmp_dir,
+                allow_summary_compaction=(
+                    use_temporary
+                    and g_config.gemini.oversized_context_strategy
+                    == OversizedContextStrategy.COMPACTION
+                ),
+                reason="temporary session replay",
+            )
         except TimeoutError:
             logger.warning(
                 f"Input preprocessing timed out after {INPUT_PREPROCESS_TIMEOUT_SECONDS:.0f}s "
@@ -3099,7 +3255,16 @@ async def create_response(
         try:
             client = await pool.acquire()
             session = client.start_chat(model=model)
-            m_input, files = await _process_conversation_with_timeout(messages, tmp_dir)
+            m_input, files = await _process_conversation_with_timeout(
+                messages,
+                tmp_dir,
+                allow_summary_compaction=(
+                    use_temporary
+                    and g_config.gemini.oversized_context_strategy
+                    == OversizedContextStrategy.COMPACTION
+                ),
+                reason="temporary fresh replay",
+            )
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
             raise HTTPException(
