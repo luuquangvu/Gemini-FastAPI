@@ -43,6 +43,13 @@ class GeminiClientWrapper(GeminiClient):
         super().__init__(**kwargs)
         self.id = client_id
         self._initialized = False
+        # Chat id of the last conversation this client opened. Its kind is not verified here -
+        # it is simply the most recent cid we saw, whether that conversation is persistent or
+        # temporary. Callers use it in temporary mode, where Google closes the open window as
+        # soon as another conversation is created, making this the only cid that can still be
+        # continuable. Deliberately in-memory and cleared on every (re)initialization: after an
+        # auto-close, restart or redeploy we can no longer vouch for any window.
+        self.latest_chat_cid: str | None = None
 
     async def init(self, *args: Any, **kwargs: Any) -> None:
         """
@@ -63,6 +70,7 @@ class GeminiClientWrapper(GeminiClient):
         try:
             await super().init(**init_kwargs)
             self._initialized = True
+            self.latest_chat_cid = None
         except Exception:
             self._initialized = False
             logger.exception(f"Failed to initialize GeminiClient {self.id}")

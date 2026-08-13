@@ -37,8 +37,7 @@ def verify_media_token(filename: str, token: str | None) -> bool:
     """Verify the provided token against the filename."""
     if expected := get_media_token(filename):
         return hmac.compare_digest(token, expected) if token else False
-    else:
-        return True  # No auth required
+    return True  # No auth required
 
 
 def cleanup_expired_media(retention_days: int) -> int:

@@ -398,6 +398,15 @@ class LMDBConversationStore(metaclass=Singleton):
                 return conv
         return None
 
+    def evict(self, conv: ConversationInStore) -> bool:
+        """Delete a stored conversation given the record itself.
+
+        Used to drop metadata that Google has already invalidated, so the next request
+        does not rediscover the same dead session and fail again.
+        """
+        key = _hash_conversation(conv.client_id, conv.model, conv.messages)
+        return self.delete(key) is not None
+
     def exists(self, key: str) -> bool:
         """Check if a key exists in the store."""
         try:
@@ -446,9 +455,7 @@ class LMDBConversationStore(metaclass=Singleton):
                 for key, _ in cursor:
                     key_str = bytes(key).decode("utf-8")
                     # Skip internal index mappings
-                    if key_str.startswith(self.HASH_LOOKUP_PREFIX) or key_str.startswith(
-                        self.FUZZY_LOOKUP_PREFIX
-                    ):
+                    if key_str.startswith((self.HASH_LOOKUP_PREFIX, self.FUZZY_LOOKUP_PREFIX)):
                         continue
 
                     if not prefix or key_str.startswith(prefix):
@@ -477,9 +484,7 @@ class LMDBConversationStore(metaclass=Singleton):
                 cursor = txn.cursor()
                 for key_bytes, value_bytes in cursor:
                     key_str = bytes(key_bytes).decode("utf-8")
-                    if key_str.startswith(self.HASH_LOOKUP_PREFIX) or key_str.startswith(
-                        self.FUZZY_LOOKUP_PREFIX
-                    ):
+                    if key_str.startswith((self.HASH_LOOKUP_PREFIX, self.FUZZY_LOOKUP_PREFIX)):
                         continue
 
                     try:

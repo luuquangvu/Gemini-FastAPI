@@ -165,9 +165,7 @@ def normalize_llm_text(s: str) -> str:
 
     s = html.unescape(s)
     s = unicodedata.normalize("NFC", s)
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-
-    return s
+    return s.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def unescape_text(s: str) -> str:
@@ -230,8 +228,7 @@ async def save_file_to_tempfile(
         delete=False, suffix=Path(file_name).suffix if file_name else ".bin", dir=tempdir
     ) as tmp:
         tmp.write(base64.b64decode(file_in_base64))
-        path = Path(tmp.name)
-    return path
+        return Path(tmp.name)
 
 
 def reject_unsafe_url(url: str) -> None:
@@ -317,8 +314,7 @@ async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempdir) as tmp:
         tmp.write(data)
-        path = Path(tmp.name)
-    return path
+        return Path(tmp.name)
 
 
 def strip_tagged_blocks(text: str) -> str:
@@ -377,9 +373,7 @@ def strip_system_hints(text: str) -> str:
     cleaned = RESPONSE_BLOCK_RE.sub("", cleaned)
     cleaned = RESPONSE_ITEM_RE.sub("", cleaned)
     cleaned = TAGGED_ARG_RE.sub("", cleaned)
-    cleaned = TAGGED_RESULT_RE.sub("", cleaned)
-
-    return cleaned
+    return TAGGED_RESULT_RE.sub("", cleaned)
 
 
 def _process_tools_internal(text: str, extract: bool = True) -> tuple[str, list[AppToolCall]]:

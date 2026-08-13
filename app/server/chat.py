@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 from gemini_webapi import ModelOutput
 from gemini_webapi.client import ChatSession
 from gemini_webapi.constants import Model
+from gemini_webapi.exceptions import ModelInvalidError
 from gemini_webapi.types.image import GeneratedImage, Image
 from gemini_webapi.types.video import GeneratedMedia, GeneratedVideo
 from loguru import logger
@@ -32,6 +33,7 @@ from app.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     CompletionUsage,
+    ConversationInStore,
     FunctionCall,
     FunctionCallOutput,
     FunctionTool,
@@ -64,7 +66,7 @@ from app.server.middleware import (
 )
 from app.services import GeminiClientPool, GeminiClientWrapper, LMDBConversationStore
 from app.utils import g_config
-from app.utils.config import get_reloaded_models, reload_models_if_changed
+from app.utils.config import ChatMode, get_reloaded_models, reload_models_if_changed
 from app.utils.helper import (
     STREAM_MASTER_RE,
     STREAM_TAIL_RE,
@@ -87,6 +89,9 @@ from app.utils.helper import (
 )
 
 MAX_CHARS_PER_REQUEST = int(g_config.gemini.max_chars_per_request * 0.9)
+# Google's temporary chat mode accepts a smaller payload than a normal chat, so tighten
+# the guardrail further on top of the standard 10% safety margin.
+TEMPORARY_MAX_CHARS_PER_REQUEST = int(MAX_CHARS_PER_REQUEST * 0.9)
 
 router = APIRouter()
 _AVAILABLE_MODELS_CACHE: list[ModelData] | None = None
@@ -320,13 +325,19 @@ def _create_chat_completion_standard_payload(
 def _persist_conversation(
     db: LMDBConversationStore,
     model_name: str,
-    client_id: str,
+    client: GeminiClientWrapper,
     metadata: list[str | None],
     messages: list[AppMessage],
     storage_output: str | None,
     tool_calls: list[AppToolCall] | None,
 ) -> str | None:
     """Unified logic to save conversation history to LMDB."""
+    if _use_temporary_chat_mode():
+        # This turn's conversation is now the last chat this client opened; any window it
+        # replaced has been closed by Google and must not be replayed again. Recorded before
+        # the store so a persistence failure cannot leave a closed window looking reusable.
+        client.latest_chat_cid = _cid_of(metadata)
+
     try:
         current_assistant_message = AppMessage(
             role="assistant",
@@ -336,8 +347,10 @@ def _persist_conversation(
         )
         full_history = [*messages, current_assistant_message]
 
+        # A temporary chat stays continuable while its window is the live one, so its metadata
+        # is worth keeping and reusing just like a normal chat's.
         db.store(
-            client_id=client_id,
+            client_id=client.id,
             model=model_name,
             messages=full_history,
             metadata=metadata,
@@ -771,15 +784,54 @@ async def _get_available_models(pool: GeminiClientPool) -> list[ModelData]:
     return await refresh_available_models_cache(pool)
 
 
+def _cid_of(metadata: list[str | None] | None) -> str | None:
+    """Chat id from a metadata list, which stores it at index 0."""
+    return metadata[0] if metadata else None
+
+
+def _is_live_temporary_chat(conv: ConversationInStore, client: GeminiClientWrapper) -> bool:
+    """Whether a stored chat can still be the open temporary window on this client.
+
+    Google closes the previous temporary conversation as soon as another one is created, so at
+    most one temporary window per client is alive at a time, and it can only be the last chat
+    the client opened. Replaying an older one makes Google start a fresh chat and answer
+    without the earlier context: a silent loss that raises no error, which is why this is
+    checked up front rather than detected after the fact.
+
+    `latest_chat_cid` is only that - the last cid this client saw. Its kind is not verified, so
+    a match is a necessary condition rather than proof the window is temporary or still open.
+    It lives in memory and is cleared on every client (re)initialization, so an auto-close,
+    restart or redeploy invalidates every stored window: once the client that opened a window
+    is gone, there is nothing left to vouch for it.
+    """
+    latest = client.latest_chat_cid
+    if not latest:
+        logger.debug(f"Client {client.id} has no chat on record; starting a fresh conversation.")
+        return False
+
+    cid = _cid_of(conv.metadata)
+    if cid and cid == latest:
+        return True
+
+    logger.debug(
+        f"Stored chat {cid!r} is not the latest ({latest!r}) on client {client.id}; a newer "
+        "conversation has closed it, so replaying the full history in a fresh conversation."
+    )
+    return False
+
+
 async def _find_reusable_session(
     db: LMDBConversationStore,
     pool: GeminiClientPool,
     model: Model,
     messages: list[AppMessage],
-) -> tuple[ChatSession | None, GeminiClientWrapper | None, list[AppMessage]]:
+    temporary: bool = False,
+) -> tuple[
+    ChatSession | None, GeminiClientWrapper | None, list[AppMessage], ConversationInStore | None
+]:
     """Find an existing chat session matching the longest suitable history prefix."""
     if len(messages) < 2:
-        return None, None, messages
+        return None, None, messages, None
 
     search_end = len(messages)
     while search_end >= 2:
@@ -788,12 +840,18 @@ async def _find_reusable_session(
             try:
                 if conv := db.find(model.model_name, search_history):
                     client = await pool.acquire(conv.client_id)
+                    # Checked after acquiring: acquire may restart a closed client, which clears
+                    # the tracked cid and is exactly what invalidates a temporary window.
+                    if temporary and not _is_live_temporary_chat(conv, client):
+                        # Every prefix of one conversation carries the same cid, so if the
+                        # longest match is not the live window, no shorter one will be either.
+                        break
                     session = client.start_chat(metadata=conv.metadata, model=model)
                     remain = messages[search_end:]
                     logger.debug(
                         f"Match found at prefix length {search_end}/{len(messages)}. Client: {conv.client_id}"
                     )
-                    return session, client, remain
+                    return session, client, remain, conv
             except Exception as e:
                 logger.warning(
                     f"Error checking LMDB for reusable session at length {search_end}: {e}"
@@ -802,7 +860,17 @@ async def _find_reusable_session(
         search_end -= 1
 
     logger.debug(f"No reusable session found for {len(messages)} messages.")
-    return None, None, messages
+    return None, None, messages, None
+
+
+def _use_temporary_chat_mode() -> bool:
+    """Whether requests should be sent through Google's temporary chat mode."""
+    return g_config.gemini.chat_mode == ChatMode.TEMPORARY
+
+
+def _effective_max_chars_per_request(temporary: bool) -> int:
+    """Return the payload guardrail for the active chat mode."""
+    return TEMPORARY_MAX_CHARS_PER_REQUEST if temporary else MAX_CHARS_PER_REQUEST
 
 
 async def _send_with_split(
@@ -810,19 +878,23 @@ async def _send_with_split(
     text: str,
     files: list[Any] | None = None,
     stream: bool = False,
+    temporary: bool = False,
 ) -> AsyncGenerator[ModelOutput] | ModelOutput:
     """Send text to Gemini with configured generation options, using an attachment if too long."""
-    if len(text) <= MAX_CHARS_PER_REQUEST:
+    limit = _effective_max_chars_per_request(temporary)
+    if len(text) <= limit:
         try:
             if stream:
                 return session.send_message_stream(
                     text,
                     files=files,
+                    temporary=temporary,
                     extended_thinking=g_config.gemini.extended_thinking,
                 )
             return await session.send_message(
                 text,
                 files=files,
+                temporary=temporary,
                 extended_thinking=g_config.gemini.extended_thinking,
             )
         except Exception as e:
@@ -830,7 +902,7 @@ async def _send_with_split(
             raise
 
     logger.info(
-        f"Message length ({len(text)}) exceeds limit ({MAX_CHARS_PER_REQUEST}). Converting text to file attachment."
+        f"Message length ({len(text)}) exceeds limit ({limit}). Converting text to file attachment."
     )
     file_obj = io.BytesIO(text.encode("utf-8"))
     file_obj.name = "message.txt"
@@ -848,16 +920,113 @@ async def _send_with_split(
             return session.send_message_stream(
                 instruction,
                 files=final_files,
+                temporary=temporary,
                 extended_thinking=g_config.gemini.extended_thinking,
             )
         return await session.send_message(
             instruction,
             files=final_files,
+            temporary=temporary,
             extended_thinking=g_config.gemini.extended_thinking,
         )
     except Exception as e:
         logger.error(f"Error sending large text as file to Gemini: {e}")
         raise
+
+
+async def _restream(
+    first: ModelOutput, rest: AsyncGenerator[ModelOutput]
+) -> AsyncGenerator[ModelOutput]:
+    """Re-emit an already-consumed first chunk, then delegate to the remainder."""
+    yield first
+    async for chunk in rest:
+        yield chunk
+
+
+async def _send_and_await_first_chunk(
+    session: ChatSession,
+    text: str,
+    *,
+    files: list[Any],
+    stream: bool,
+    temporary: bool,
+) -> AsyncGenerator[ModelOutput] | ModelOutput:
+    """Send to Gemini, pulling the first streamed chunk so start-of-stream errors surface here.
+
+    `send_message_stream` is an async generator function: calling it runs none of its body, so
+    without this the request would not reach Google until the caller iterates - by which point
+    the HTTP response has already been committed and a failure can no longer be recovered.
+    """
+    output = await _send_with_split(session, text, files=files, stream=stream, temporary=temporary)
+    if not stream:
+        return output
+
+    generator = cast(AsyncGenerator[ModelOutput], output)
+    try:
+        first = await anext(generator)
+    except StopAsyncIteration:
+        return generator  # already exhausted, so iterating it again simply yields nothing
+    except BaseException:
+        await generator.aclose()
+        raise
+    return _restream(first, generator)
+
+
+async def _send_with_internal_fallback(
+    *,
+    pool: GeminiClientPool,
+    db: LMDBConversationStore,
+    model: Model,
+    session: ChatSession,
+    client: GeminiClientWrapper,
+    current_input: str,
+    files: list[Any],
+    full_prepared_messages: list[AppMessage],
+    stored_conversation: ConversationInStore | None,
+    tmp_dir: Path,
+    stream: bool,
+    temporary: bool,
+) -> tuple[AsyncGenerator[ModelOutput] | ModelOutput, ChatSession, GeminiClientWrapper]:
+    """Send the request, replaying the full history in a fresh chat if reused metadata is dead.
+
+    Streaming is recovered as well as non-streaming: the first chunk is pulled here, which is
+    where Google reports a rejected chat, so the retry happens before any response is committed
+    to the client. The cost is that response headers wait for Google's first chunk.
+    """
+    try:
+        output = await _send_and_await_first_chunk(
+            session, current_input, files=files, stream=stream, temporary=temporary
+        )
+        return output, session, client
+    except ModelInvalidError:
+        if stored_conversation is None:
+            raise
+
+        # Drop the dead metadata so the next request does not rediscover and re-fail on it.
+        try:
+            if db.evict(stored_conversation):
+                logger.info("Evicted stale conversation metadata after Google rejected it.")
+        except Exception as evict_exc:
+            logger.warning(f"Failed to evict stale conversation metadata: {evict_exc}")
+
+        logger.warning(
+            "Metadata-backed chat reuse failed; retrying with internal history replay in a fresh chat."
+        )
+        fallback_client = await pool.acquire()
+        fallback_session = fallback_client.start_chat(model=model)
+        fallback_input, fallback_files = await GeminiClientWrapper.process_conversation(
+            full_prepared_messages, tmp_dir
+        )
+        # Keep the caller's streaming mode: the endpoints reject a ModelOutput when the client
+        # asked for a stream, so downgrading here would turn a recovery into a 502.
+        output = await _send_and_await_first_chunk(
+            fallback_session,
+            fallback_input,
+            files=list(fallback_files),
+            stream=stream,
+            temporary=temporary,
+        )
+        return output, fallback_session, fallback_client
 
 
 class StreamingOutputFilter:
@@ -1281,7 +1450,7 @@ def _create_real_streaming_response(
         _persist_conversation(
             db,
             model.model_name,
-            client_wrapper.id,
+            client_wrapper,
             session.metadata,
             messages,
             storage_output,
@@ -2214,7 +2383,7 @@ def _create_responses_real_streaming_response(
         _persist_conversation(
             db,
             model.model_name,
-            client_wrapper.id,
+            client_wrapper,
             session.metadata,
             messages,
             storage_output,
@@ -2388,8 +2557,9 @@ async def create_chat_completion(
         extra_instr,
     )
 
-    session, client, remain = (
-        (None, None, msgs) if request.gem else await _find_reusable_session(db, pool, model, msgs)
+    use_temporary = _use_temporary_chat_mode()
+    session, client, remain, stored_conv = await _find_reusable_session(
+        db, pool, model, msgs, temporary=use_temporary
     )
 
     if session:
@@ -2411,7 +2581,7 @@ async def create_chat_completion(
     else:
         try:
             client = await pool.acquire()
-            session = client.start_chat(model=model, gem=request.gem)
+            session = client.start_chat(model=model)
             m_input, files = await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
@@ -2422,20 +2592,40 @@ async def create_chat_completion(
     completion_id = f"chatcmpl-{uuid.uuid4()}"
     created_time = int(datetime.now(tz=UTC).timestamp())
 
+    if session is None or client is None:
+        logger.error("No Gemini session or client available after preparing conversation.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No available Gemini client."
+        )
+
     try:
-        assert session and client
         logger.debug(
             f"Client ID: {client.id}, Input length: {len(m_input)}, files count: {len(files)}"
         )
-        resp_or_stream = await _send_with_split(
-            session, m_input, files=files, stream=bool(request.stream)
+        resp_or_stream, session, client = await _send_with_internal_fallback(
+            pool=pool,
+            db=db,
+            model=model,
+            session=session,
+            client=client,
+            current_input=m_input,
+            files=files,
+            full_prepared_messages=msgs,
+            stored_conversation=stored_conv,
+            tmp_dir=tmp_dir,
+            stream=bool(request.stream),
+            temporary=use_temporary,
         )
     except Exception as e:
         logger.error(f"Gemini API error: {e}")
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 
     if request.stream:
-        assert not isinstance(resp_or_stream, ModelOutput)
+        if isinstance(resp_or_stream, ModelOutput):
+            logger.error("Expected a streaming response from Gemini but got a complete output.")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail="Streaming response unavailable."
+            )
         return _create_real_streaming_response(
             resp_or_stream,
             completion_id,
@@ -2450,7 +2640,11 @@ async def create_chat_completion(
             structured_requirement,
         )
 
-    assert isinstance(resp_or_stream, ModelOutput)
+    if not isinstance(resp_or_stream, ModelOutput):
+        logger.error("Expected a complete output from Gemini but got a stream.")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected streaming response."
+        )
 
     thoughts, visible_output, storage_output, tool_calls = process_llm_output(
         normalize_llm_text(resp_or_stream.thoughts or ""),
@@ -2573,7 +2767,7 @@ async def create_chat_completion(
     _persist_conversation(
         db,
         model.model_name,
-        client.id,
+        client,
         session.metadata,
         msgs,
         storage_output,
@@ -2643,10 +2837,9 @@ async def create_response(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    session, client, remain = (
-        (None, None, messages)
-        if request.gem
-        else await _find_reusable_session(db, pool, model, messages)
+    use_temporary = _use_temporary_chat_mode()
+    session, client, remain, stored_conv = await _find_reusable_session(
+        db, pool, model, messages, temporary=use_temporary
     )
     if session:
         msgs = _prepare_messages_for_model(
@@ -2665,7 +2858,7 @@ async def create_response(
     else:
         try:
             client = await pool.acquire()
-            session = client.start_chat(model=model, gem=request.gem)
+            session = client.start_chat(model=model)
             m_input, files = await GeminiClientWrapper.process_conversation(messages, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
@@ -2676,20 +2869,40 @@ async def create_response(
     response_id = f"resp_{uuid.uuid4().hex}"
     created_time = int(datetime.now(tz=UTC).timestamp())
 
+    if session is None or client is None:
+        logger.error("No Gemini session or client available after preparing conversation.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No available Gemini client."
+        )
+
     try:
-        assert session and client
         logger.debug(
             f"Client ID: {client.id}, Input length: {len(m_input)}, files count: {len(files)}"
         )
-        resp_or_stream = await _send_with_split(
-            session, m_input, files=files, stream=bool(request.stream)
+        resp_or_stream, session, client = await _send_with_internal_fallback(
+            pool=pool,
+            db=db,
+            model=model,
+            session=session,
+            client=client,
+            current_input=m_input,
+            files=files,
+            full_prepared_messages=messages,
+            stored_conversation=stored_conv,
+            tmp_dir=tmp_dir,
+            stream=bool(request.stream),
+            temporary=use_temporary,
         )
     except Exception as e:
         logger.error(f"Gemini API error: {e}")
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 
     if request.stream:
-        assert not isinstance(resp_or_stream, ModelOutput)
+        if isinstance(resp_or_stream, ModelOutput):
+            logger.error("Expected a streaming response from Gemini but got a complete output.")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail="Streaming response unavailable."
+            )
         return _create_responses_real_streaming_response(
             resp_or_stream,
             response_id,
@@ -2705,7 +2918,11 @@ async def create_response(
             structured_requirement,
         )
 
-    assert isinstance(resp_or_stream, ModelOutput)
+    if not isinstance(resp_or_stream, ModelOutput):
+        logger.error("Expected a complete output from Gemini but got a stream.")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected streaming response."
+        )
 
     thoughts, assistant_text, storage_output, tool_calls = process_llm_output(
         normalize_llm_text(resp_or_stream.thoughts or ""),
@@ -2873,7 +3090,7 @@ async def create_response(
     _persist_conversation(
         db,
         model.model_name,
-        client.id,
+        client,
         session.metadata,
         messages,
         storage_output,

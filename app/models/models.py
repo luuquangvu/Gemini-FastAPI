@@ -161,7 +161,6 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool | None = Field(default=True)
     deep_research: bool | None = Field(default=None)
     deep_research_timeout: int | None = Field(default=None, ge=10)
-    gem: str | None = Field(default=None)
     video_wait_timeout: int | None = Field(default=None, ge=1)
 
 
@@ -455,7 +454,6 @@ class ResponseCreateRequest(BaseModel):
     response_format: dict[str, Any] | None = Field(default=None)
     metadata: dict[str, Any] | None = Field(default=None)
     parallel_tool_calls: bool | None = Field(default=True)
-    gem: str | None = Field(default=None)
     video_wait_timeout: int | None = Field(default=None, ge=1)
 
 

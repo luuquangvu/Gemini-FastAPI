@@ -2,6 +2,7 @@ import ast
 import os
 import sys
 import tempfile
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
 
@@ -95,6 +96,13 @@ class GeminiModelConfig(BaseModel):
         return v
 
 
+class ChatMode(StrEnum):
+    """Chat mode options for Gemini conversation handling."""
+
+    NORMAL = "normal"
+    TEMPORARY = "temporary"
+
+
 class GeminiConfig(BaseModel):
     """Gemini API configuration, including session behavior and generation options."""
 
@@ -152,6 +160,15 @@ class GeminiConfig(BaseModel):
         ge=1,
         le=120,
         description="Timeout in seconds for server-side URL image fetches",
+    )
+    chat_mode: ChatMode = Field(
+        default=ChatMode.NORMAL,
+        description=(
+            "Chat mode: 'normal' uses standard chats; 'temporary' sends with Google's temporary "
+            "mode (not saved to the account) and applies a tighter effective input limit. "
+            "Warning: Google may close a temporary window at any time mid-conversation, and the "
+            "reply can then come back without the earlier context instead of erroring"
+        ),
     )
 
     @field_validator("models", mode="before")

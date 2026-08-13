@@ -46,7 +46,7 @@ cd Gemini-FastAPI
 pip install -e .
 ```
 
-### Configuration
+### Basic Configuration
 
 Edit `config/config.yaml` and provide at least one credential pair:
 
@@ -61,7 +61,7 @@ gemini:
 ```
 
 > [!NOTE]
-> For details, refer to the [Configuration](#configuration-1) section below.
+> For details, refer to the [Configuration](#configuration) section below.
 
 ### Running the Server
 
@@ -214,6 +214,8 @@ To use Gemini-FastAPI, you need to extract your Gemini session cookies:
 >
 > While active chat turns may work temporarily without it, any transient error, TLS session restart, or server reboot can cause Google to expire the conversation metadata. If this setting is disabled, the model will **completely lose the context of your multi-turn conversation**, making old threads unreachable even if they are stored in your local LMDB.
 
+<!-- Keeps the two callouts as separate blockquotes (markdownlint MD028). -->
+
 > [!TIP]
 > For detailed instructions, refer to the [HanaokaYuzu/Gemini-API authentication guide](https://github.com/HanaokaYuzu/Gemini-API?tab=readme-ov-file#authentication).
 
@@ -236,6 +238,56 @@ gemini:
       impersonate: "chrome" # Use Chrome fingerprint
     - id: "client-b"
       impersonate: null # Use library default
+```
+
+### Chat Session Mode
+
+You can control whether requests use normal Google chats or Google's temporary chat mode:
+
+```yaml
+gemini:
+  chat_mode: "normal" # "normal" or "temporary"
+  max_chars_per_request: 1000000
+```
+
+With `temporary`, conversations are not saved to the Google account. A temporary chat is still
+continuable for as long as Google keeps the window open, so session reuse and conversation
+storage work exactly as they do in normal mode.
+
+When a stored chat can no longer be continued - after changing `chat_mode`, or once Google has
+closed a temporary window - the server falls back to replaying the full conversation history
+into a fresh chat, so the context is rebuilt rather than lost.
+
+Google keeps at most one temporary window open per account and closes the previous one as soon
+as a new conversation is created, so only the most recently opened temporary chat is still
+continuable. The server tracks that chat per client and reuses **only** it; any older temporary
+conversation is replayed in full into a fresh chat instead. There is no timeout to tune - the
+rule follows Google's actual behaviour rather than guessing at an expiry.
+
+That tracking is deliberately in-memory, so it is also cleared whenever the client session
+restarts - an `auto_close` after inactivity, a server restart, or a redeploy. After any of
+those, no window can be vouched for and every stored temporary conversation is replayed rather
+than reused.
+
+This applies **only** in temporary mode. A normal chat is kept by Google until you delete it,
+so its metadata stays reusable indefinitely and across restarts.
+
+> [!WARNING]
+> Google can close a temporary chat window at any time, without notice and mid-conversation.
+> When that happens the reply may come back without the earlier context instead of raising an
+> error, so the loss can be silent. The server replays the full history into a fresh chat when
+> it can detect the chat is gone, but detection is not guaranteed. Prefer `normal` for long or
+> context-sensitive conversations, and treat `temporary` as best-effort continuity.
+
+Because temporary chats accept a smaller payload, the server applies an additional 10% reduction
+on top of the standard safety margin, so the effective input limit becomes 81% of
+`max_chars_per_request` instead of 90%. Input exceeding the effective limit is still sent as a
+`message.txt` attachment in both modes.
+
+Environment variable equivalent:
+
+```bash
+export CONFIG_GEMINI__CHAT_MODE="temporary"
 ```
 
 ### Custom Models
