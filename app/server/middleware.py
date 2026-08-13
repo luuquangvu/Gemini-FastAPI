@@ -86,6 +86,36 @@ def get_temp_dir():
         temp_dir.cleanup()
 
 
+def verify_gemini_api_key(request: Request):
+    """Gemini-style auth: x-goog-api-key header, key= query param, or Bearer fallback."""
+    if not g_config.server.api_key:
+        return ""
+
+    # 1) x-goog-api-key header
+    api_key = request.headers.get("x-goog-api-key")
+    if api_key:
+        if api_key != g_config.server.api_key:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Wrong API key")
+        return api_key
+
+    # 2) key= query parameter
+    api_key = request.query_params.get("key")
+    if api_key:
+        if api_key != g_config.server.api_key:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Wrong API key")
+        return api_key
+
+    # 3) fall back to Authorization: Bearer
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        api_key = auth_header[7:]
+        if api_key != g_config.server.api_key:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Wrong API key")
+        return api_key
+
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key")
+
+
 def verify_api_key(
     credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
 ):

@@ -22,6 +22,8 @@ for _ext, _mime in (
 
 from .server.chat import refresh_available_models_cache
 from .server.chat import router as chat_router
+from .server.gemini import add_gemini_exception_handlers  # noqa: E402
+from .server.gemini import router as gemini_router  # noqa: E402
 from .server.health import router as health_router
 from .server.media import router as media_router
 from .server.middleware import (
@@ -122,9 +124,11 @@ def create_app() -> FastAPI:
 
     add_cors_middleware(app)
     add_exception_handler(app)
+    add_gemini_exception_handlers(app)
 
     app.include_router(health_router, tags=["Health"])
     app.include_router(chat_router, tags=["Chat"])
     app.include_router(media_router, tags=["Media"])
+    app.include_router(gemini_router, tags=["Gemini"])
 
     return app
