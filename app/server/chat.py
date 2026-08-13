@@ -3,6 +3,7 @@ import base64
 import hashlib
 import io
 import reprlib
+import time
 import uuid
 from collections.abc import AsyncGenerator, Sequence
 from datetime import UTC, datetime
@@ -53,6 +54,7 @@ from app.models import (
     SummaryTextContent,
     ToolChoiceFunction,
     ToolChoiceTypes,
+    VideoGeneration,
 )
 from app.server.middleware import (
     get_media_store_dir,
@@ -62,6 +64,7 @@ from app.server.middleware import (
 )
 from app.services import GeminiClientPool, GeminiClientWrapper, LMDBConversationStore
 from app.utils import g_config
+from app.utils.config import get_reloaded_models, reload_models_if_changed
 from app.utils.helper import (
     STREAM_MASTER_RE,
     STREAM_TAIL_RE,
@@ -69,6 +72,7 @@ from app.utils.helper import (
     append_tool_hint_to_last_user_message,
     build_image_generation_instruction,
     build_tool_prompt,
+    build_video_generation_instruction,
     calculate_usage,
     convert_to_app_messages,
     detect_image_extension,
@@ -86,6 +90,7 @@ MAX_CHARS_PER_REQUEST = int(g_config.gemini.max_chars_per_request * 0.9)
 
 router = APIRouter()
 _AVAILABLE_MODELS_CACHE: list[ModelData] | None = None
+_AVAILABLE_MODELS_FINGERPRINT: tuple[str, ...] | None = None
 _AVAILABLE_MODELS_CACHE_LOCK = asyncio.Lock()
 
 
@@ -396,6 +401,23 @@ def _build_structured_requirement(
     )
 
 
+def _extract_last_user_text(messages: list[ChatCompletionMessage]) -> str:
+    """Return the text of the last user message (string or text parts)."""
+    for msg in reversed(messages):
+        if msg.role != "user":
+            continue
+        content = msg.content
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                part.text or ""
+                for part in content
+                if getattr(part, "type", None) == "text" and part.text
+            )
+    return ""
+
+
 def _prepare_messages_for_model(
     source_messages: list[AppMessage],
     tools: Sequence[Any] | None,
@@ -651,9 +673,14 @@ def _convert_instructions_to_app_messages(
 
 
 def _get_model_by_name(name: str) -> Model:
-    """Retrieve a Model instance by name."""
+    """Retrieve a Model instance by name.
+
+    Resolution order: custom model name → dependency Model enum (with its built-in
+    normalized match) → configured `default_model` fallback → ValueError (400).
+    """
+    reload_models_if_changed()
     strategy = g_config.gemini.model_strategy
-    custom_models = {m.model_name: m for m in g_config.gemini.models if m.model_name}
+    custom_models = {m.model_name: m for m in get_reloaded_models() if m.model_name}
 
     if name in custom_models:
         return Model.from_dict(custom_models[name].model_dump())
@@ -661,17 +688,32 @@ def _get_model_by_name(name: str) -> Model:
     if strategy == "overwrite":
         raise ValueError(f"Model '{name}' not found in custom models (strategy='overwrite').")
 
-    return Model.from_name(name)
+    try:
+        return Model.from_name(name)
+    except ValueError:
+        default_model = g_config.gemini.default_model
+        if not default_model or default_model.strip().lower() == name.strip().lower():
+            raise
+        logger.warning(
+            f"Model '{name}' not found; falling back to default_model '{default_model}'."
+        )
+        try:
+            return _get_model_by_name(default_model)
+        except ValueError:
+            raise ValueError(
+                f"Unknown model name: {name} (default_model '{default_model}' not found either)."
+            ) from None
 
 
 async def _build_available_models(pool: GeminiClientPool) -> list[ModelData]:
     """Build the available model list from configured models and currently running clients."""
+    reload_models_if_changed()
     now = int(datetime.now(tz=UTC).timestamp())
     strategy = g_config.gemini.model_strategy
     models_data = []
     seen_model_ids = set()
 
-    for model in g_config.gemini.models:
+    for model in get_reloaded_models():
         if model.model_name and model.model_name not in seen_model_ids:
             models_data.append(
                 ModelData(
@@ -705,19 +747,26 @@ async def _build_available_models(pool: GeminiClientPool) -> list[ModelData]:
 
 async def refresh_available_models_cache(pool: GeminiClientPool) -> list[ModelData]:
     """Refresh and return the cached model list while clients are available."""
-    global _AVAILABLE_MODELS_CACHE
+    global _AVAILABLE_MODELS_CACHE, _AVAILABLE_MODELS_FINGERPRINT
 
     async with _AVAILABLE_MODELS_CACHE_LOCK:
         models = await _build_available_models(pool)
         _AVAILABLE_MODELS_CACHE = models
+        _AVAILABLE_MODELS_FINGERPRINT = tuple(
+            m.model_name for m in get_reloaded_models() if m.model_name
+        )
         logger.info(f"Cached {len(models)} available model(s).")
         return list(models)
 
 
 async def _get_available_models(pool: GeminiClientPool) -> list[ModelData]:
-    """Return cached available models, populating the cache if it has not been warmed yet."""
+    """Return cached available models, refreshing when the custom model list changed."""
+    reload_models_if_changed()
     if _AVAILABLE_MODELS_CACHE is not None:
-        return list(_AVAILABLE_MODELS_CACHE)
+        current_fingerprint = tuple(m.model_name for m in get_reloaded_models() if m.model_name)
+        if current_fingerprint == _AVAILABLE_MODELS_FINGERPRINT:
+            return list(_AVAILABLE_MODELS_CACHE)
+        logger.info("Custom model list changed; refreshing available-models cache.")
 
     return await refresh_available_models_cache(pool)
 
@@ -941,6 +990,42 @@ async def _process_media_item(
 # --- Response Builders & Streaming ---
 
 
+async def _recover_stream_output(
+    client_wrapper: GeminiClientWrapper,
+    session: ChatSession,
+    prev_rcid: str,
+    recover_timeout: int,
+) -> ModelOutput | None:
+    """Recover the full model turn from the conversation-turns RPC after a truncated stream.
+
+    Gemini finalizes the turn server-side even when the stream dies mid-response.
+    Polls until a completed turn with a NEW rcid appears (rec_rcid != prev_rcid,
+    parity with the pinned dependency's own recovery gate), or the timeout
+    elapses.
+    """
+    cid = getattr(session, "cid", "") or ""
+    if not cid or recover_timeout <= 0:
+        return None
+    deadline = time.monotonic() + recover_timeout
+    while time.monotonic() < deadline:
+        try:
+            recovered = await client_wrapper.fetch_last_model_turn(cid)
+        except Exception as e:
+            logger.warning(f"[Recovery] Turns RPC failed for {cid}: {type(e).__name__}: {e}")
+            break
+        if recovered is not None:
+            rec_rcid = recovered.rcid or ""
+            if rec_rcid and (not prev_rcid or rec_rcid != prev_rcid):
+                logger.info(f"[Recovery] Full turn recovered for {cid} (rcid {rec_rcid})")
+                return recovered
+            logger.debug(
+                f"[Recovery] Turn not ready for {cid} (rcid {rec_rcid!r}, prev {prev_rcid!r}); waiting..."
+            )
+        await asyncio.sleep(10)
+    logger.warning(f"[Recovery] Timed out after {recover_timeout}s for {cid}")
+    return None
+
+
 def _create_real_streaming_response(
     resp_or_stream: AsyncGenerator[ModelOutput] | ModelOutput,
     completion_id: str,
@@ -966,6 +1051,7 @@ def _create_real_streaming_response(
         has_started = False
         all_outputs: list[ModelOutput] = []
         suppressor = StreamingOutputFilter()
+        prev_rcid = getattr(session, "rcid", "") or ""
 
         media_tasks = []
         seen_media_urls = set()
@@ -1026,8 +1112,26 @@ def _create_real_streaming_response(
                         media_tasks.append(asyncio.create_task(_process_media_item(m)))
         except Exception as e:
             logger.error(f"Error during streaming: {e}")
-            yield f"data: {orjson.dumps({'error': {'message': f'Streaming error occurred: {e}', 'type': 'server_error', 'param': None, 'code': None}}).decode('utf-8')}\n\n"
-            return
+            if not structured_requirement and (remainder := suppressor.flush()):
+                yield make_chunk({"delta": {"content": remainder}, "finish_reason": None})
+            recovered = await _recover_stream_output(
+                client_wrapper, session, prev_rcid, g_config.gemini.recovery_timeout
+            )
+            if recovered is None:
+                yield f"data: {orjson.dumps({'error': {'message': f'Streaming error occurred: {e}', 'type': 'server_error', 'param': None, 'code': None}}).decode('utf-8')}\n\n"
+                return
+            logger.info(f"Stream truncated; recovered full turn text for {session.cid}.")
+            rec_thoughts = recovered.thoughts or ""
+            if rec_thoughts.startswith(full_thoughts) and len(rec_thoughts) > len(full_thoughts):
+                t_tail = rec_thoughts[len(full_thoughts) :]
+                full_thoughts = rec_thoughts
+                yield make_chunk({"delta": {"reasoning_content": t_tail}, "finish_reason": None})
+            rec_text = recovered.text or ""
+            if rec_text.startswith(full_text) and len(rec_text) > len(full_text):
+                text_tail = rec_text[len(full_text) :]
+                full_text = rec_text
+                if not structured_requirement and (visible_tail := suppressor.process(text_tail)):
+                    yield make_chunk({"delta": {"content": visible_tail}, "finish_reason": None})
 
         if all_outputs:
             final_chunk = all_outputs[-1]
@@ -1283,6 +1387,7 @@ def _create_responses_real_streaming_response(
         thought_index = 0
         message_index = 0
         suppressor = StreamingOutputFilter()
+        prev_rcid = getattr(session, "rcid", "") or ""
 
         try:
             if hasattr(resp_or_stream, "__aiter__"):
@@ -1452,15 +1557,130 @@ def _create_responses_real_streaming_response(
 
         except Exception as e:
             logger.error(f"Error during streaming: {e}")
-            yield make_event(
-                "error",
-                {
-                    **base_event,
-                    "type": "error",
-                    "error": {"message": f"Streaming error occurred: {e}"},
-                },
+            remaining = "" if structured_requirement else suppressor.flush()
+            if remaining and message_open:
+                yield make_event(
+                    "response.output_text.delta",
+                    {
+                        **base_event,
+                        "type": "response.output_text.delta",
+                        "item_id": message_item_id,
+                        "output_index": message_index,
+                        "content_index": 0,
+                        "delta": remaining,
+                        "logprobs": [],
+                    },
+                )
+            recovered = await _recover_stream_output(
+                client_wrapper, session, prev_rcid, g_config.gemini.recovery_timeout
             )
-            return
+            if recovered is None:
+                yield make_event(
+                    "error",
+                    {
+                        **base_event,
+                        "type": "error",
+                        "error": {"message": f"Streaming error occurred: {e}"},
+                    },
+                )
+                return
+            logger.info(f"Stream truncated; recovered full turn text for {session.cid}.")
+            rec_thoughts = recovered.thoughts or ""
+            if rec_thoughts.startswith(full_thoughts) and len(rec_thoughts) > len(full_thoughts):
+                t_tail = rec_thoughts[len(full_thoughts) :]
+                full_thoughts = rec_thoughts
+                if not thought_open:
+                    thought_index = next_output_index
+                    next_output_index += 1
+                    yield make_event(
+                        "response.output_item.added",
+                        {
+                            **base_event,
+                            "type": "response.output_item.added",
+                            "output_index": thought_index,
+                            "item": dump_model(
+                                ResponseReasoningItem(
+                                    id=thought_item_id,
+                                    type="reasoning",
+                                    status="in_progress",
+                                    summary=[],
+                                )
+                            ),
+                        },
+                    )
+                    yield make_event(
+                        "response.reasoning_summary_part.added",
+                        {
+                            **base_event,
+                            "type": "response.reasoning_summary_part.added",
+                            "item_id": thought_item_id,
+                            "output_index": thought_index,
+                            "summary_index": 0,
+                            "part": dump_model(SummaryTextContent(text="")),
+                        },
+                    )
+                    thought_open = True
+                yield make_event(
+                    "response.reasoning_summary_text.delta",
+                    {
+                        **base_event,
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": thought_item_id,
+                        "output_index": thought_index,
+                        "summary_index": 0,
+                        "delta": t_tail,
+                    },
+                )
+            rec_text = recovered.text or ""
+            if rec_text.startswith(full_text) and len(rec_text) > len(full_text):
+                text_tail = rec_text[len(full_text) :]
+                full_text = rec_text
+                if not structured_requirement:
+                    if not message_open:
+                        message_index = next_output_index
+                        next_output_index += 1
+                        yield make_event(
+                            "response.output_item.added",
+                            {
+                                **base_event,
+                                "type": "response.output_item.added",
+                                "output_index": message_index,
+                                "item": dump_model(
+                                    ResponseOutputMessage(
+                                        id=message_item_id,
+                                        type="message",
+                                        status="in_progress",
+                                        role="assistant",
+                                        content=[],
+                                    )
+                                ),
+                            },
+                        )
+                        yield make_event(
+                            "response.content_part.added",
+                            {
+                                **base_event,
+                                "type": "response.content_part.added",
+                                "item_id": message_item_id,
+                                "output_index": message_index,
+                                "content_index": 0,
+                                "part": dump_model(ResponseOutputText(type="output_text", text="")),
+                            },
+                        )
+                        message_open = True
+                    if visible := suppressor.process(text_tail):
+                        yield make_event(
+                            "response.output_text.delta",
+                            {
+                                **base_event,
+                                "type": "response.output_text.delta",
+                                "item_id": message_item_id,
+                                "output_index": message_index,
+                                "content_index": 0,
+                                "delta": visible,
+                                "logprobs": [],
+                            },
+                        )
 
         if all_outputs:
             last = all_outputs[-1]
@@ -2025,6 +2245,30 @@ async def list_models(api_key: str = Depends(verify_api_key)):
     return ModelListResponse(data=models)
 
 
+@router.get("/v1/gems")
+async def list_gems(api_key: str = Depends(verify_api_key)):
+    pool = GeminiClientPool()
+    try:
+        client = await pool.acquire()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
+    try:
+        gems = await client.fetch_gems()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": gem.id,
+                "name": gem.name,
+                "description": getattr(gem, "description", None),
+            }
+            for gem in gems.values()
+        ],
+    }
+
+
 @router.post("/v1/chat/completions", response_model_exclude_none=True)
 async def create_chat_completion(
     request: ChatCompletionRequest,
@@ -2041,10 +2285,101 @@ async def create_chat_completion(
     if not request.messages:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Messages required.")
 
+    app_messages = convert_to_app_messages(request.messages)
+
+    if request.deep_research:
+        if request.stream:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Streaming is not supported for deep research.",
+            )
+        prompt = _extract_last_user_text(request.messages)
+        if not prompt:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Deep research requires a non-empty user text message.",
+            )
+        research_timeout = request.deep_research_timeout or 600
+        try:
+            client = await pool.acquire()
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
+            ) from e
+        fallback_report: str | None = None
+        try:
+            research_plan = await client.create_deep_research_plan(prompt)
+            start_output = await client.start_deep_research(research_plan)
+            if (
+                not research_plan.research_id
+                and start_output.deep_research_plan
+                and start_output.deep_research_plan.research_id
+            ):
+                research_plan.research_id = start_output.deep_research_plan.research_id
+            if research_plan.research_id:
+                result = await client.wait_for_deep_research(
+                    research_plan, timeout=research_timeout
+                )
+                result.start_output = start_output
+            else:
+                logger.warning(
+                    "Deep research: plan.research_id is missing on this account; "
+                    f"falling back to turns-RPC report crawl (cid={research_plan.cid}, "
+                    f"timeout={research_timeout}s)."
+                )
+                fallback_report = await client.fetch_deep_research_report(
+                    research_plan, timeout=research_timeout
+                )
+                if fallback_report is None:
+                    raise RuntimeError(
+                        f"Deep research report not available over HTTP after "
+                        f"{research_timeout}s; the research completes in your Gemini "
+                        f"web history (cid={research_plan.cid})."
+                    )
+                result = None
+        except Exception as e:
+            logger.error(f"Deep research error: {e}")
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+
+        research_text = ""
+        if result is not None:
+            if result.final_output is not None:
+                research_text = result.final_output.text or ""
+            if not research_text:
+                research_text = result.plan.response_text or ""
+        else:
+            research_text = fallback_report or ""
+        if result is None or result.done:
+            visible_output = research_text
+        else:
+            eta = result.plan.eta_text or ""
+            visible_output = (
+                f"Deep research started (research_id={result.plan.research_id}, {eta}). "
+                f"The full report continues in your Gemini web history.\n\n{research_text}"
+            )
+
+        research_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created_time = int(datetime.now(tz=UTC).timestamp())
+        p_tok, c_tok, t_tok, r_tok = calculate_usage(app_messages, visible_output, None, "")
+        usage = {
+            "prompt_tokens": p_tok,
+            "completion_tokens": c_tok,
+            "total_tokens": t_tok,
+            "completion_tokens_details": {"reasoning_tokens": r_tok},
+        }
+        return _create_chat_completion_standard_payload(
+            research_id,
+            created_time,
+            request.model,
+            visible_output,
+            None,
+            "stop",
+            usage,
+            "",
+        )
+
     structured_requirement = _build_structured_requirement(request.response_format)
     extra_instr = [structured_requirement.instruction] if structured_requirement else None
-
-    app_messages = convert_to_app_messages(request.messages)
 
     msgs = _prepare_messages_for_model(
         app_messages,
@@ -2053,7 +2388,9 @@ async def create_chat_completion(
         extra_instr,
     )
 
-    session, client, remain = await _find_reusable_session(db, pool, model, msgs)
+    session, client, remain = (
+        (None, None, msgs) if request.gem else await _find_reusable_session(db, pool, model, msgs)
+    )
 
     if session:
         if not remain:
@@ -2074,7 +2411,7 @@ async def create_chat_completion(
     else:
         try:
             client = await pool.acquire()
-            session = client.start_chat(model=model)
+            session = client.start_chat(model=model, gem=request.gem)
             m_input, files = await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
@@ -2257,18 +2594,22 @@ async def create_response(
     structured_requirement = _build_structured_requirement(request.response_format)
     extra_instr = [structured_requirement.instruction] if structured_requirement else []
 
-    standard_tools, image_tools = [], []
+    standard_tools, image_tools, video_tools = [], [], []
     if request.tools:
         for t in request.tools:
             if isinstance(t, FunctionTool):
                 standard_tools.append(t)
             elif isinstance(t, ImageGeneration):
                 image_tools.append(t)
+            elif isinstance(t, VideoGeneration):
+                video_tools.append(t)
             elif isinstance(t, dict):
                 if t.get("type") == "function":
                     standard_tools.append(FunctionTool.model_validate(t))
                 elif t.get("type") == "image_generation":
                     image_tools.append(ImageGeneration.model_validate(t))
+                elif t.get("type") == "video_generation":
+                    video_tools.append(VideoGeneration.model_validate(t))
 
     img_instr = build_image_generation_instruction(
         image_tools,
@@ -2276,6 +2617,12 @@ async def create_response(
     )
     if img_instr:
         extra_instr.append(img_instr)
+    video_instr = build_video_generation_instruction(
+        video_tools,
+        request.tool_choice if isinstance(request.tool_choice, ToolChoiceFunction) else None,
+    )
+    if video_instr:
+        extra_instr.append(video_instr)
     preface = _convert_instructions_to_app_messages(request.instructions)
     conv_messages = [*preface, *base_messages] if preface else base_messages
     model_tool_choice = (
@@ -2296,7 +2643,11 @@ async def create_response(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    session, client, remain = await _find_reusable_session(db, pool, model, messages)
+    session, client, remain = (
+        (None, None, messages)
+        if request.gem
+        else await _find_reusable_session(db, pool, model, messages)
+    )
     if session:
         msgs = _prepare_messages_for_model(
             remain,
@@ -2314,7 +2665,7 @@ async def create_response(
     else:
         try:
             client = await pool.acquire()
-            session = client.start_chat(model=model)
+            session = client.start_chat(model=model, gem=request.gem)
             m_input, files = await GeminiClientWrapper.process_conversation(messages, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
@@ -2362,15 +2713,44 @@ async def create_response(
         structured_requirement,
     )
     images = resp_or_stream.images or []
+    videos = resp_or_stream.videos or []
+    video_wait = request.video_wait_timeout or 600
+    video_requested = (
+        isinstance(request.tool_choice, ToolChoiceTypes)
+        and request.tool_choice.type == "video_generation"
+    ) or bool(video_tools)
+    if video_requested and not videos:
+        deadline = time.monotonic() + video_wait
+        logger.debug(f"Video generation in progress, polling turns up to {video_wait}s.")
+        while time.monotonic() < deadline:
+            try:
+                videos = await client.fetch_videos_from_turns(session.cid)
+            except Exception as e:
+                logger.warning(f"Failed to fetch videos from turns: {e}")
+                break
+            if videos:
+                break
+            await asyncio.sleep(15)
     if (
         isinstance(request.tool_choice, ToolChoiceTypes)
         and request.tool_choice.type == "image_generation"
     ) and not images:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="No images returned.")
+    if (
+        isinstance(request.tool_choice, ToolChoiceTypes)
+        and request.tool_choice.type == "video_generation"
+    ) and not videos:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"No videos returned within {video_wait}s. Video generation is "
+                "asynchronous; the video may still complete in Gemini web history."
+            ),
+        )
 
     unique_media = []
     seen_urls = set()
-    for m in (resp_or_stream.videos or []) + (resp_or_stream.media or []):
+    for m in videos + (resp_or_stream.media or []):
         p_url = getattr(m, "url", None) or getattr(m, "mp3_url", None)
         if p_url and p_url not in seen_urls:
             unique_media.append(m)

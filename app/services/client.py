@@ -1,10 +1,20 @@
+import asyncio
 import io
+import time
 from pathlib import Path
 from typing import Any
 
 import orjson
 from gemini_webapi import GeminiClient
-from gemini_webapi.constants import AccountStatus
+from gemini_webapi.constants import GRPC, AccountStatus
+from gemini_webapi.types import (
+    Candidate,
+    DeepResearchPlan,
+    GeneratedVideo,
+    ModelOutput,
+    RPCData,
+)
+from gemini_webapi.utils import extract_json_from_response, get_nested_value
 from loguru import logger
 
 from app.models import AppMessage
@@ -13,6 +23,15 @@ from app.utils.helper import (
     add_tag,
     save_file_to_tempfile,
     save_url_to_tempfile,
+)
+
+_SESSION_VALIDATION_PROMPT = "Reply with exactly OK."
+_AUTH_FAILURE_TEXT_PATTERNS = (
+    "are you signed in",
+    "sign in",
+    "signed in",
+    "log in",
+    "logged in",
 )
 
 
@@ -51,6 +70,302 @@ class GeminiClientWrapper(GeminiClient):
 
     def running(self) -> bool:
         return self._running
+
+    async def validate_session(self, timeout: int = 60) -> bool:
+        """Probe the session with a minimal temporary chat.
+
+        Detects silently-degraded sessions (signed-out / "are you signed in"
+        bodies) that pass library init but would fail on the first real request.
+        Uses `temporary=True` so NO conversation is persisted — standing fact:
+        conversations on this account cannot be deleted.
+        """
+        try:
+            response = await asyncio.wait_for(
+                self.generate_content(_SESSION_VALIDATION_PROMPT, temporary=True),
+                timeout=timeout,
+            )
+            response_text = getattr(response, "text", "") or ""
+        except Exception as e:
+            logger.warning(f"Session validation probe failed for client {self.id}: {e}")
+            return False
+        normalized = response_text.strip().lower()
+        if not normalized or any(pattern in normalized for pattern in _AUTH_FAILURE_TEXT_PATTERNS):
+            logger.warning(
+                f"Session validation probe returned suspicious content for client "
+                f"{self.id}: {response_text[:120]!r}"
+            )
+            return False
+        logger.info(f"Session validation probe succeeded for client {self.id}.")
+        return True
+
+    async def fetch_videos_from_turns(self, cid: str, limit: int = 10) -> list[GeneratedVideo]:
+        """Recover generated videos from the conversation-turns RPC.
+
+        Video generation is asynchronous server-side: the live response usually
+        carries only the placeholder text, while the actual video metadata lands
+        in the finalized turn. The pinned dependency's extraction path
+        (candidate [12][59]) does not match the observed payload shape
+        (candidate[12][0]["60"][0][0][0][0] with url list at item[7]), so we
+        crawl the raw turns payload directly.
+        """
+        resp = await self._batch_execute(
+            [
+                RPCData(
+                    rpcid=GRPC.LIST_CONVERSATION_TURNS,
+                    payload=orjson.dumps([cid, limit, None, 1, [1], [4], None, 1]).decode("utf-8"),
+                )
+            ]
+        )
+        parts = extract_json_from_response(resp.text)
+        videos: list[GeneratedVideo] = []
+        seen: set[str] = set()
+        for part in parts:
+            body = get_nested_value(part, [2])
+            if not body:
+                continue
+            try:
+                part_body = orjson.loads(body) if isinstance(body, str) else body
+            except orjson.JSONDecodeError:
+                continue
+            for turn in get_nested_value(part_body, [0]) or []:
+                for cand in get_nested_value(turn, [3, 0]) or []:
+                    if not isinstance(cand, list) or len(cand) <= 12:
+                        continue
+                    blocks = cand[12]
+                    if not isinstance(blocks, list):
+                        continue
+                    for block in blocks:
+                        item = None
+                        if isinstance(block, dict) and isinstance(block.get("60"), list):
+                            nested = block["60"]
+                            try:
+                                item = get_nested_value(nested, [0, 0, 0, 0])
+                            except Exception:
+                                item = None
+                        if not isinstance(item, list) or len(item) < 12:
+                            continue
+                        filename = get_nested_value(item, [2], "")
+                        mime = get_nested_value(item, [11], "")
+                        if not (str(filename).endswith(".mp4") or "video" in str(mime)):
+                            continue
+                        urls = get_nested_value(item, [7], []) or []
+                        video_url = next(
+                            (
+                                u
+                                for u in urls
+                                if isinstance(u, str)
+                                and "contribution.usercontent.google.com/download" in u
+                                and "filename=video.mp4" in u
+                            ),
+                            None,
+                        )
+                        thumbnail = next(
+                            (
+                                u
+                                for u in urls
+                                if isinstance(u, str) and "lh3.googleusercontent.com" in u
+                            ),
+                            None,
+                        )
+                        if not video_url or video_url in seen:
+                            continue
+                        seen.add(video_url)
+                        videos.append(
+                            GeneratedVideo(
+                                url=video_url,
+                                thumbnail=thumbnail or "",
+                                cid=cid,
+                                client_ref=self,
+                                proxy=self.proxy,
+                            )
+                        )
+        return videos
+
+    async def fetch_last_model_turn(self, cid: str, limit: int = 10) -> ModelOutput | None:
+        """Fetch the newest completed model turn from the conversation-turns RPC.
+
+        Used for stream recovery: when a stream dies mid-response, Gemini still
+        finalizes the complete turn server-side. Returns the newest completed
+        model turn (full text + thoughts), or None when no finalized turn is
+        present yet — callers should poll. Extraction mirrors the dependency's
+        own read_chat shape: text at candidate[1][0], thoughts at [37][0][0],
+        completion indicator at [8][0] == 2.
+        """
+        resp = await self._batch_execute(
+            [
+                RPCData(
+                    rpcid=GRPC.LIST_CONVERSATION_TURNS,
+                    payload=orjson.dumps([cid, limit, None, 1, [1], [4], None, 1]).decode("utf-8"),
+                )
+            ]
+        )
+        parts = extract_json_from_response(resp.text)
+        for part in parts:
+            body = get_nested_value(part, [2])
+            if not body:
+                continue
+            try:
+                part_body = orjson.loads(body) if isinstance(body, str) else body
+            except orjson.JSONDecodeError:
+                continue
+            for turn in get_nested_value(part_body, [0]) or []:
+                rid = get_nested_value(turn, [0, 1], "")
+                candidates = get_nested_value(turn, [3, 0]) or []
+                for candidate_data in candidates:
+                    if not isinstance(candidate_data, list):
+                        continue
+                    rcid = get_nested_value(candidate_data, [0], "")
+                    if not rcid:
+                        continue
+                    if get_nested_value(candidate_data, [8, 0]) != 2:
+                        continue
+                    text = get_nested_value(candidate_data, [1, 0], "") or ""
+                    thoughts = get_nested_value(candidate_data, [37, 0, 0]) or ""
+                    if not (text or thoughts):
+                        continue
+                    candidate = Candidate(
+                        rcid=rcid,
+                        text=text,
+                        text_delta=text,
+                        thoughts=thoughts,
+                        thoughts_delta=thoughts,
+                    )
+                    return ModelOutput(metadata=[cid, rid], candidates=[candidate])
+        return None
+
+    async def fetch_deep_research_report(
+        self,
+        plan: DeepResearchPlan,
+        poll_interval: float = 10.0,
+        timeout: float = 600.0,
+        min_report_chars: int = 1500,
+    ) -> str | None:
+        """Poll the conversation-turns RPC for a completed deep-research report.
+
+        Fallback for accounts where ``plan.research_id`` never materializes and
+        the dependency's ``wait_for_deep_research`` raises before any poll
+        (research_mixin.py:333). Research still completes server-side; the full
+        report text lands in the completed turn's research block
+        (candidate[30][0][4], measured 19,787-26,356 chars on this account —
+        the plain text slot candidate[1][0] only carries a short completion
+        note). Same crawl shape as ``fetch_last_model_turn`` (rcid + completion
+        gate [8][0]==2 are both required), extended to extract the research
+        block. Returns the longest report-scale completed-turn text once it has
+        stayed stable across a confirmation poll, or None on timeout (the
+        caller decides the HTTP mapping). ``min_report_chars`` = 1500: measured
+        progress notes are 142-169 chars and plan text 144, so 1500 separates
+        reports (>10x) without a false positive.
+        """
+        cid = plan.cid or ""
+        if not cid:
+            logger.warning("Deep research fallback: plan.cid is missing; cannot poll turns RPC.")
+            return None
+        deadline = time.monotonic() + timeout
+        best_text: str | None = None
+        best_rcid = ""
+        stable_polls = 0
+        while time.monotonic() < deadline:
+            try:
+                report_texts = await self._crawl_report_texts(cid, limit=10)
+            except Exception as e:
+                logger.warning(
+                    f"Deep research fallback: turns RPC failed for {cid} "
+                    f"({type(e).__name__}: {e}); retrying until timeout."
+                )
+                report_texts = []
+            current_rcid, current_text = self._longest_report_scale(report_texts, min_report_chars)
+            elapsed = timeout - max(0.0, deadline - time.monotonic())
+            logger.info(
+                f"Deep research fallback poll (cid={cid}): elapsed={elapsed:.0f}s, "
+                f"longest_report_scale={len(current_text) if current_text else 0} chars, "
+                f"best={len(best_text) if best_text else 0} chars"
+            )
+            if current_text is not None and (
+                best_text is None or len(current_text) > len(best_text)
+            ):
+                best_text = current_text
+                best_rcid = current_rcid
+                stable_polls = 0
+            elif best_text is not None:
+                if current_rcid != best_rcid:
+                    logger.info(
+                        f"Deep research fallback: report turn {best_rcid} superseded by "
+                        f"{current_rcid} (shorter); settling on longest seen."
+                    )
+                    return best_text
+                stable_polls += 1
+                if stable_polls >= 1:
+                    logger.info(
+                        f"Deep research fallback: report crawl settled on {len(best_text)} "
+                        f"chars (rcid {best_rcid})."
+                    )
+                    return best_text
+            await asyncio.sleep(poll_interval)
+        logger.warning(
+            f"Deep research fallback: timed out after {timeout}s (best "
+            f"{len(best_text) if best_text else 0} chars); research may still "
+            f"complete in Gemini web history."
+        )
+        return None
+
+    async def _crawl_report_texts(self, cid: str, limit: int = 10) -> list[tuple[str, str]]:
+        """Crawl completed model turns and return (rcid, report-scale text) pairs."""
+        resp = await self._batch_execute(
+            [
+                RPCData(
+                    rpcid=GRPC.LIST_CONVERSATION_TURNS,
+                    payload=orjson.dumps([cid, limit, None, 1, [1], [4], None, 1]).decode("utf-8"),
+                )
+            ]
+        )
+        texts: list[tuple[str, str]] = []
+        parts = extract_json_from_response(resp.text)
+        for part in parts:
+            body = get_nested_value(part, [2])
+            if not body:
+                continue
+            try:
+                part_body = orjson.loads(body) if isinstance(body, str) else body
+            except orjson.JSONDecodeError:
+                continue
+            for turn in get_nested_value(part_body, [0]) or []:
+                candidates = get_nested_value(turn, [3, 0]) or []
+                for candidate_data in candidates:
+                    if not isinstance(candidate_data, list):
+                        continue
+                    rcid = get_nested_value(candidate_data, [0], "")
+                    if not rcid:
+                        continue
+                    if get_nested_value(candidate_data, [8, 0]) != 2:
+                        continue
+                    block = get_nested_value(candidate_data, [30], None)
+                    report_text = ""
+                    if isinstance(block, list) and block and isinstance(block[0], list):
+                        head = block[0]
+                        if len(head) > 4 and isinstance(head[4], str):
+                            report_text = head[4]
+                    plain_text = get_nested_value(candidate_data, [1, 0], "") or ""
+                    candidate_text = (
+                        report_text if len(report_text) >= len(plain_text) else plain_text
+                    )
+                    if candidate_text:
+                        texts.append((rcid, candidate_text))
+        return texts
+
+    @staticmethod
+    def _longest_report_scale(
+        texts: list[tuple[str, str]], min_report_chars: int
+    ) -> tuple[str, str | None]:
+        """Pick the longest completed-turn text at or above the report threshold."""
+        longest_rcid = ""
+        longest_text: str | None = None
+        longest_len = 0
+        for rcid, text in texts:
+            if len(text) >= min_report_chars and len(text) > longest_len:
+                longest_rcid = rcid
+                longest_text = text
+                longest_len = len(text)
+        return longest_rcid, longest_text
 
     def is_healthy(self) -> bool:
         """

@@ -1,8 +1,24 @@
 import asyncio
+import mimetypes
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from loguru import logger
+
+# Canonical audio MIME types: Python's platform mapping yields legacy "x-"
+# types (audio/x-wav, audio/x-aac, audio/x-flac) that Google's upload
+# endpoint does not classify as audio, so the attached file never reaches
+# the model as an audible attachment. Registered before any upload happens.
+for _ext, _mime in (
+    (".wav", "audio/wav"),
+    (".aac", "audio/aac"),
+    (".flac", "audio/flac"),
+    (".m4a", "audio/mp4"),
+):
+    try:
+        mimetypes.add_type(_mime, _ext)
+    except ValueError:
+        pass
 
 from .server.chat import refresh_available_models_cache
 from .server.chat import router as chat_router

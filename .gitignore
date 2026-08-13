@@ -11,3 +11,6 @@ __pycache__
 .env
 config.debug.yaml
 data/
+# local secrets / host-specific
+config/config.yaml
+.DS_Store

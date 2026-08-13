@@ -1,12 +1,14 @@
 import ast
 import os
 import sys
+import tempfile
+from pathlib import Path
 from typing import Any, Literal, cast, get_args
 
 import orjson
 from curl_cffi import BrowserTypeLiteral
 from loguru import logger
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     SettingsConfigDict,
@@ -106,6 +108,11 @@ class GeminiConfig(BaseModel):
     )
     timeout: int = Field(default=450, ge=30, description="Init timeout in seconds")
     watchdog_timeout: int = Field(default=120, ge=30, description="Watchdog timeout in seconds")
+    recovery_timeout: int = Field(
+        default=300,
+        ge=30,
+        description="Timeout in seconds for conversation-turns recovery after a truncated stream",
+    )
     auto_refresh: bool = Field(True, description="Enable auto-refresh for Gemini sessions")
     refresh_interval: int = Field(
         default=600,
@@ -128,6 +135,24 @@ class GeminiConfig(BaseModel):
         ge=1,
         description="Maximum characters Gemini Web can accept per request",
     )
+    default_model: str | None = Field(
+        default=None,
+        description="Fallback model name used when a requested model is unknown (null disables fallback)",
+    )
+    validate_session_on_init: bool = Field(
+        default=True,
+        description="Run a temporary-chat session validation probe when clients initialize",
+    )
+    allow_private_url_fetch: bool = Field(
+        default=False,
+        description="Allow server-side fetching of private/loopback image URLs (SSRF risk; default blocks them)",
+    )
+    url_fetch_timeout: int = Field(
+        default=15,
+        ge=1,
+        le=120,
+        description="Timeout in seconds for server-side URL image fetches",
+    )
 
     @field_validator("models", mode="before")
     @classmethod
@@ -147,20 +172,17 @@ class GeminiConfig(BaseModel):
     @classmethod
     def _filter_valid_models(cls, v: list[GeminiModelConfig]) -> list[GeminiModelConfig]:
         """Filter out models that don't have all required fields set."""
-        valid_models = []
-        for model in v:
-            if model.model_name and model.model_header:
-                valid_models.append(model)
-            else:
-                missing = []
-                if not model.model_name:
-                    missing.append("model_name")
-                if not model.model_header:
-                    missing.append("model_header")
-                logger.warning(
-                    f"Discarding custom model due to missing {', '.join(missing)}: {model}"
-                )
-        return valid_models
+        return filter_valid_models(v)
+
+    @model_validator(mode="after")
+    def _bound_recovery_timeout(self) -> "GeminiConfig":
+        if self.recovery_timeout > self.timeout:
+            logger.warning(
+                f"recovery_timeout ({self.recovery_timeout}) exceeds timeout "
+                f"({self.timeout}); clamping recovery_timeout to timeout."
+            )
+            self.recovery_timeout = self.timeout
+        return self
 
 
 class CORSConfig(BaseModel):
@@ -370,6 +392,117 @@ def _merge_models_with_env(
     return result_models
 
 
+def filter_valid_models(v: list[GeminiModelConfig]) -> list[GeminiModelConfig]:
+    """Filter out models that don't have all required fields set."""
+    valid_models = []
+    for model in v:
+        if model.model_name and model.model_header:
+            valid_models.append(model)
+        else:
+            missing = []
+            if not model.model_name:
+                missing.append("model_name")
+            if not model.model_header:
+                missing.append("model_header")
+            logger.warning(f"Discarding custom model due to missing {', '.join(missing)}: {model}")
+    return valid_models
+
+
+_RELOAD_STATE: dict[str, Any] = {
+    "mtime": None,
+    "models": None,
+}
+
+
+def register_boot_models(models: list[GeminiModelConfig]) -> None:
+    """Record the boot-time merged model list and the config file mtime."""
+    _RELOAD_STATE["models"] = [m.model_copy() for m in models]
+    try:
+        _RELOAD_STATE["mtime"] = Path(CONFIG_PATH).stat().st_mtime
+    except OSError:
+        _RELOAD_STATE["mtime"] = None
+
+
+def reload_models_if_changed() -> bool:
+    """Reload `gemini.models` from the config yaml when its mtime changes.
+
+    Hot edits to config.yaml's model list apply on the next request without a
+    restart. Boot-time env overrides (CONFIG_GEMINI__MODELS) stay in force until
+    restart: the env vars are consumed at boot (pydantic-settings mechanics) and
+    are not re-applied on hot reload. On any read/parse failure the previously
+    known list is kept and a WARNING is logged — request paths never break.
+    """
+    path = Path(CONFIG_PATH)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return False
+    if mtime == _RELOAD_STATE["mtime"]:
+        return False
+    current = _RELOAD_STATE["models"]
+
+    import yaml
+
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8") or "{}") or {}
+        models_raw = (raw.get("gemini") or {}).get("models") or []
+        if not isinstance(models_raw, list):
+            raise ValueError("gemini.models must be a list")
+        models: list[GeminiModelConfig] = []
+        for entry in models_raw:
+            try:
+                models.append(GeminiModelConfig.model_validate(entry))
+            except ValidationError as e:
+                raise ValueError(f"invalid model entry: {e}") from e
+        reloaded = filter_valid_models(models)
+    except Exception as e:
+        logger.warning(f"Hot reload of gemini.models failed ({e}); keeping previous model list.")
+        _RELOAD_STATE["mtime"] = mtime
+        return False
+
+    _RELOAD_STATE["models"] = reloaded
+    _RELOAD_STATE["mtime"] = mtime
+    if reloaded != current:
+        logger.info(
+            f"Hot reloaded {len(reloaded)} custom model(s) from {CONFIG_PATH} "
+            f"(was {len(current) if current else 0})."
+        )
+    return True
+
+
+def get_reloaded_models() -> list[GeminiModelConfig]:
+    """Return the current effective custom model list (boot list unless hot-reloaded)."""
+    return list(_RELOAD_STATE["models"] or [])
+
+
+def load_cached_1psidts(psid: str) -> str | None:
+    """Return the cached rotated __Secure-1PSIDTS for the given 1PSID, if a cache file exists.
+
+    Mirrors the pinned dependency's cookie cache layout
+    (gemini_webapi/utils/rotate_1psidts.py): ${GEMINI_COOKIE_PATH:-$TMPDIR/gemini_webapi}/
+    .cached_cookies_<psid>.json holds a cookie-name/value list written on rotation.
+    """
+    if not psid:
+        return None
+    cache_dir = os.getenv("GEMINI_COOKIE_PATH") or os.path.join(
+        tempfile.gettempdir(), "gemini_webapi"
+    )
+    cache_path = Path(cache_dir) / f".cached_cookies_{psid}.json"
+    if not cache_path.is_file():
+        return None
+    try:
+        cookies = orjson.loads(cache_path.read_bytes())
+    except (OSError, orjson.JSONDecodeError) as e:
+        logger.warning(f"Failed to read cookie cache {cache_path}: {e}")
+        return None
+    for cookie in cookies or []:
+        if isinstance(cookie, dict) and cookie.get("name") == "__Secure-1PSIDTS":
+            value = cookie.get("value")
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
 def initialize_config() -> Config:
     """
     Initialize configuration from environment variables and the YAML settings source.
@@ -387,6 +520,7 @@ def initialize_config() -> Config:
             config.gemini.clients, env_clients_overrides
         )
         config.gemini.models = _merge_models_with_env(config.gemini.models, env_models_overrides)
+        register_boot_models(config.gemini.models)
 
         return config
     except ValidationError as e:

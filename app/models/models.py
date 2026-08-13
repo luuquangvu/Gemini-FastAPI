@@ -159,6 +159,10 @@ class ChatCompletionRequest(BaseModel):
     )
     response_format: dict[str, Any] | None = Field(default=None)
     parallel_tool_calls: bool | None = Field(default=True)
+    deep_research: bool | None = Field(default=None)
+    deep_research_timeout: int | None = Field(default=None, ge=10)
+    gem: str | None = Field(default=None)
+    video_wait_timeout: int | None = Field(default=None, ge=1)
 
 
 class ChatCompletionResponse(BaseModel):
@@ -292,7 +296,17 @@ class ToolChoiceFunction(BaseModel):
 class ToolChoiceTypes(BaseModel):
     """Forces the model to use a specific built-in tool type."""
 
-    type: Literal["image_generation"]
+    type: Literal["image_generation", "video_generation"]
+
+
+class VideoGeneration(BaseModel):
+    """Video-generation built-in tool for the Responses API."""
+
+    type: Literal["video_generation"]
+    prompt: str | None = Field(default=None)
+    model: str | None = Field(default=None)
+    quality: Literal["low", "medium", "high", "auto"] = Field(default="auto")
+    duration: str | None = Field(default=None)
 
 
 class ResponseUsage(BaseModel):
@@ -433,14 +447,16 @@ class ResponseCreateRequest(BaseModel):
     tool_choice: (
         Literal["none", "auto", "required"] | ToolChoiceFunction | ToolChoiceTypes | None
     ) = Field(default=None)
-    tools: list[FunctionTool | ChatCompletionFunctionTool | ImageGeneration] | None = Field(
-        default=None
-    )
+    tools: (
+        list[FunctionTool | ChatCompletionFunctionTool | ImageGeneration | VideoGeneration] | None
+    ) = Field(default=None)
     store: bool | None = Field(default=None)
     prompt_cache_key: str | None = Field(default=None)
     response_format: dict[str, Any] | None = Field(default=None)
     metadata: dict[str, Any] | None = Field(default=None)
     parallel_tool_calls: bool | None = Field(default=True)
+    gem: str | None = Field(default=None)
+    video_wait_timeout: int | None = Field(default=None, ge=1)
 
 
 class ResponseCreateResponse(BaseModel):
