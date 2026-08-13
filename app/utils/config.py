@@ -103,6 +103,13 @@ class ChatMode(StrEnum):
     TEMPORARY = "temporary"
 
 
+class OversizedContextStrategy(StrEnum):
+    """Strategy for handling oversized context."""
+
+    COMPACTION = "compaction"
+    FILE = "file"
+
+
 class GeminiConfig(BaseModel):
     """Gemini API configuration, including session behavior and generation options."""
 
@@ -142,6 +149,14 @@ class GeminiConfig(BaseModel):
         default=1_000_000,
         ge=1,
         description="Maximum characters Gemini Web can accept per request",
+    )
+    oversized_context_strategy: OversizedContextStrategy = Field(
+        default=OversizedContextStrategy.FILE,
+        description=(
+            "Strategy for oversized context: 'compaction' summarizes older turns into a "
+            "bounded summary block (last 8 kept verbatim) for temporary/fallback replay; "
+            "'file' sends oversized context as an attachment (default, behavior-preserving)"
+        ),
     )
     default_model: str | None = Field(
         default=None,
