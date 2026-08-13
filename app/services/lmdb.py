@@ -128,8 +128,8 @@ class LMDBConversationStore(metaclass=Singleton):
 
         Args:
             db_path: Path to LMDB database directory
-            max_db_size: Maximum database size in bytes (default: 256 MB)
-            retention_days: Number of days to retain conversations (default: 14, 0 disables cleanup)
+            max_db_size: Maximum database size in bytes (default: 1 GB)
+            retention_days: Number of days to retain conversations (default: 7, 0 disables cleanup)
         """
         if db_path is None:
             db_path = g_config.storage.path

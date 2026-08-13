@@ -245,12 +245,12 @@ class StorageConfig(BaseModel):
         description="Path to the directory where generated media will be stored",
     )
     max_size: int = Field(
-        default=1024**2 * 256,  # 256 MB
+        default=1024**3,  # 1 GB
         ge=1,
         description="Maximum size of the storage in bytes",
     )
     retention_days: int = Field(
-        default=14,
+        default=7,
         ge=0,
         description="Number of days to retain conversations before automatic cleanup (0 disables cleanup)",
     )

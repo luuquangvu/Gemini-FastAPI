@@ -186,8 +186,19 @@ export CONFIG_GEMINI__CLIENTS__0__IMPERSONATE="chrome"
 
 
 # Override conversation storage size limit
-export CONFIG_STORAGE__MAX_SIZE=268435456  # 256 MB
+export CONFIG_STORAGE__MAX_SIZE=1073741824  # 1 GB
+
+# Override conversation retention (days before automatic cleanup, 0 disables cleanup)
+export CONFIG_STORAGE__RETENTION_DAYS=7
 ```
+
+> [!NOTE]
+> The LMDB map size (`storage.max_size`, default 1 GB) is fixed when the store
+> opens. When the data file grows to that ceiling every write fails with
+> `MDB_MAP_FULL` — the map never grows on its own. If that happens, raise
+> `max_size` and **restart** the server; existing data is preserved. The
+> 6-hourly cleanup task (main.py) reclaims space once conversations are older
+> than `retention_days` (default 7).
 
 ### Client IDs and Conversation Reuse
 

@@ -43,8 +43,8 @@ gemini:
 storage:
   path: "data/lmdb" # Database storage path
   media_path: "data/media" # Media storage path
-  max_size: 268435456 # Maximum database size (256 MB)
-  retention_days: 14 # Number of days to retain conversations before cleanup
+  max_size: 1073741824 # Maximum database size (1 GB)
+  retention_days: 7 # Number of days to retain conversations before cleanup
 
 logging:
   level: "DEBUG" # Log level: DEBUG, INFO, WARNING, ERROR

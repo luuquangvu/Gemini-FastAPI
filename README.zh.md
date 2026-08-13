@@ -186,7 +186,7 @@ export CONFIG_GEMINI__CLIENTS__0__IMPERSONATE="chrome"
 
 
 # 覆盖对话存储大小限制
-export CONFIG_STORAGE__MAX_SIZE=268435456  # 256 MB
+export CONFIG_STORAGE__MAX_SIZE=1073741824  # 1 GB
 ```
 
 ### 客户端 ID 与会话重用
