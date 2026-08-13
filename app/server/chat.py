@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import re
 import reprlib
 import time
 import uuid
@@ -13,7 +14,7 @@ from typing import Any, Literal, cast
 import orjson
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from gemini_webapi import ModelOutput
+from gemini_webapi import AvailableModel, ModelOutput
 from gemini_webapi.client import ChatSession
 from gemini_webapi.constants import Model
 from gemini_webapi.exceptions import ModelInvalidError
@@ -97,6 +98,7 @@ router = APIRouter()
 _AVAILABLE_MODELS_CACHE: list[ModelData] | None = None
 _AVAILABLE_MODELS_FINGERPRINT: tuple[str, ...] | None = None
 _AVAILABLE_MODELS_CACHE_LOCK = asyncio.Lock()
+_RUNTIME_MODELS_CACHE: list[AvailableModel] | None = None
 
 
 type ProcessedImageData = tuple[str, int | None, int | None, str, str]
@@ -685,11 +687,70 @@ def _convert_instructions_to_app_messages(
     return instruction_messages
 
 
-def _get_model_by_name(name: str) -> Model:
+def _slug_model_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+def _public_runtime_model_name(model: AvailableModel) -> str:
+    if model.model_name:
+        return model.model_name
+
+    display_slug = _slug_model_name(model.display_name)
+    if display_slug:
+        if display_slug[0].isdigit():
+            return f"gemini-{display_slug}"
+        return f"gemini-web-{display_slug}"
+
+    return f"gemini-web-{model.model_id}"
+
+
+def _normalized_runtime_model(model: AvailableModel) -> AvailableModel:
+    public_name = _public_runtime_model_name(model)
+    if model.model_name == public_name:
+        return model
+    return model.model_copy(update={"model_name": public_name})
+
+
+def _runtime_models(pool: GeminiClientPool | None) -> list[AvailableModel]:
+    if pool is None:
+        return []
+
+    models: list[AvailableModel] = []
+    seen_ids: set[str] = set()
+    for client in pool.clients:
+        if not client.running():
+            continue
+        for model in client.list_models() or []:
+            if not model.model_id or model.model_id in seen_ids:
+                continue
+            seen_ids.add(model.model_id)
+            models.append(_normalized_runtime_model(model))
+    return models
+
+
+def _runtime_model_aliases(model: AvailableModel) -> set[str]:
+    aliases = {model.model_name, model.model_id, model.display_name}
+    if model.display_name:
+        display_slug = _slug_model_name(model.display_name)
+        if display_slug:
+            aliases.add(
+                f"gemini-{display_slug}"
+                if display_slug[0].isdigit()
+                else f"gemini-web-{display_slug}"
+            )
+    return {alias for alias in aliases if alias}
+
+
+GeminiRuntimeModel = Model | AvailableModel
+
+
+def _get_model_by_name(name: str, pool: GeminiClientPool | None = None) -> GeminiRuntimeModel:
     """Retrieve a Model instance by name.
 
-    Resolution order: custom model name → dependency Model enum (with its built-in
-    normalized match) → configured `default_model` fallback → ValueError (400).
+    Resolution order: custom model name → runtime-discovered model (running
+    clients' `list_models()` aliases) → dependency Model enum (with its
+    built-in normalized match) → configured `default_model` fallback →
+    ValueError (400).
     """
     reload_models_if_changed()
     strategy = g_config.gemini.model_strategy
@@ -698,8 +759,17 @@ def _get_model_by_name(name: str) -> Model:
     if name in custom_models:
         return Model.from_dict(custom_models[name].model_dump())
 
+    runtime_models = (
+        _RUNTIME_MODELS_CACHE if _RUNTIME_MODELS_CACHE is not None else _runtime_models(pool)
+    )
+    for model in runtime_models:
+        if name in _runtime_model_aliases(model):
+            return model
+
     if strategy == "overwrite":
-        raise ValueError(f"Model '{name}' not found in custom models (strategy='overwrite').")
+        raise ValueError(
+            f"Model '{name}' not found in custom or runtime models (strategy='overwrite')."
+        )
 
     try:
         return Model.from_name(name)
@@ -718,8 +788,10 @@ def _get_model_by_name(name: str) -> Model:
             ) from None
 
 
-async def _build_available_models(pool: GeminiClientPool) -> list[ModelData]:
-    """Build the available model list from configured models and currently running clients."""
+async def _build_available_models(
+    pool: GeminiClientPool, runtime_models: list[AvailableModel]
+) -> list[ModelData]:
+    """Build the available model list from configured, runtime-discovered, and built-in models."""
     reload_models_if_changed()
     now = int(datetime.now(tz=UTC).timestamp())
     strategy = g_config.gemini.model_strategy
@@ -737,33 +809,42 @@ async def _build_available_models(pool: GeminiClientPool) -> list[ModelData]:
             )
             seen_model_ids.add(model.model_name)
 
-    if strategy == "append":
-        for client in pool.clients:
-            if not client.running():
-                continue
+    for model in runtime_models:
+        model_id = model.model_name or model.model_id
+        if model_id and model_id != "unspecified" and model_id not in seen_model_ids:
+            models_data.append(
+                ModelData(
+                    id=model_id,
+                    created=now,
+                    owned_by="google",
+                )
+            )
+            seen_model_ids.add(model_id)
 
-            if client_models := client.list_models():
-                for model in client_models:
-                    model_id = model.model_name or model.model_id
-                    if model_id and model_id not in seen_model_ids:
-                        models_data.append(
-                            ModelData(
-                                id=model_id,
-                                created=now,
-                                owned_by="google",
-                            )
-                        )
-                        seen_model_ids.add(model_id)
+    if strategy == "append":
+        for model in Model:
+            model_id = model.model_name
+            if model_id and model_id != "unspecified" and model_id not in seen_model_ids:
+                models_data.append(
+                    ModelData(
+                        id=model_id,
+                        created=now,
+                        owned_by="google",
+                    )
+                )
+                seen_model_ids.add(model_id)
 
     return models_data
 
 
 async def refresh_available_models_cache(pool: GeminiClientPool) -> list[ModelData]:
     """Refresh and return the cached model list while clients are available."""
-    global _AVAILABLE_MODELS_CACHE, _AVAILABLE_MODELS_FINGERPRINT
+    global _AVAILABLE_MODELS_CACHE, _AVAILABLE_MODELS_FINGERPRINT, _RUNTIME_MODELS_CACHE
 
     async with _AVAILABLE_MODELS_CACHE_LOCK:
-        models = await _build_available_models(pool)
+        runtime_models = _runtime_models(pool)
+        _RUNTIME_MODELS_CACHE = runtime_models
+        models = await _build_available_models(pool, runtime_models)
         _AVAILABLE_MODELS_CACHE = models
         _AVAILABLE_MODELS_FINGERPRINT = tuple(
             m.model_name for m in get_reloaded_models() if m.model_name
@@ -823,7 +904,7 @@ def _is_live_temporary_chat(conv: ConversationInStore, client: GeminiClientWrapp
 async def _find_reusable_session(
     db: LMDBConversationStore,
     pool: GeminiClientPool,
-    model: Model,
+    model: GeminiRuntimeModel,
     messages: list[AppMessage],
     temporary: bool = False,
 ) -> tuple[
@@ -976,7 +1057,7 @@ async def _send_with_internal_fallback(
     *,
     pool: GeminiClientPool,
     db: LMDBConversationStore,
-    model: Model,
+    model: GeminiRuntimeModel,
     session: ChatSession,
     client: GeminiClientWrapper,
     current_input: str,
@@ -1202,7 +1283,7 @@ def _create_real_streaming_response(
     model_name: str,
     messages: list[AppMessage],
     db: LMDBConversationStore,
-    model: Model,
+    model: GeminiRuntimeModel,
     client_wrapper: GeminiClientWrapper,
     session: ChatSession,
     base_url: str,
@@ -1475,7 +1556,7 @@ def _create_responses_real_streaming_response(
     model_name: str,
     messages: list[AppMessage],
     db: LMDBConversationStore,
-    model: Model,
+    model: GeminiRuntimeModel,
     client_wrapper: GeminiClientWrapper,
     session: ChatSession,
     request: ResponseCreateRequest,
@@ -2448,7 +2529,7 @@ async def create_chat_completion(
     base_url = str(raw_request.base_url)
     pool, db = GeminiClientPool(), LMDBConversationStore()
     try:
-        model = _get_model_by_name(request.model)
+        model = _get_model_by_name(request.model, pool)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     if not request.messages:
@@ -2833,7 +2914,7 @@ async def create_response(
     )
     pool, db = GeminiClientPool(), LMDBConversationStore()
     try:
-        model = _get_model_by_name(request.model)
+        model = _get_model_by_name(request.model, pool)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
