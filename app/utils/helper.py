@@ -31,7 +31,6 @@ from app.models import (
     StructuredOutputRequirement,
     ToolChoiceFunction,
     ToolChoiceTypes,
-    VideoGeneration,
 )
 from app.utils import g_config
 
