@@ -831,32 +831,6 @@ def build_image_generation_instruction(
     return "\n\n".join(instructions)
 
 
-def build_video_generation_instruction(
-    tools: list[VideoGeneration] | None,
-    tool_choice: ToolChoiceFunction | None,
-) -> str | None:
-    """Construct explicit guidance so Gemini emits a video when requested."""
-    has_forced_choice = tool_choice is not None and tool_choice.type == "video_generation"
-    primary = tools[0] if tools else None
-
-    if not has_forced_choice and primary is None:
-        return None
-
-    instructions: list[str] = [
-        "VIDEO GENERATION ENABLED: When a video is requested, you MUST return a real generated video directly.",
-        "1. For new requests, generate a new video matching the description immediately.",
-        "2. CRITICAL: Provide ZERO text explanation, prologue, or apologies. Do not describe the creation process.",
-        "3. NEVER send placeholder text or descriptions like 'Generating video...' without an actual video attachment.",
-    ]
-
-    if has_forced_choice:
-        instructions.append(
-            "Video generation was explicitly requested. You MUST return at least one generated video. Any response without a video will be treated as a failure."
-        )
-
-    return "\n\n".join(instructions)
-
-
 def append_tool_hint_to_last_user_message(messages: list[AppMessage]) -> None:
     """Ensure the last user message carries the tool wrap hint."""
     for msg in reversed(messages):
