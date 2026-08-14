@@ -1,29 +1,15 @@
 import asyncio
+import contextlib
 import mimetypes
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from loguru import logger
 
-# Canonical audio MIME types: Python's platform mapping yields legacy "x-"
-# types (audio/x-wav, audio/x-aac, audio/x-flac) that Google's upload
-# endpoint does not classify as audio, so the attached file never reaches
-# the model as an audible attachment. Registered before any upload happens.
-for _ext, _mime in (
-    (".wav", "audio/wav"),
-    (".aac", "audio/aac"),
-    (".flac", "audio/flac"),
-    (".m4a", "audio/mp4"),
-):
-    try:
-        mimetypes.add_type(_mime, _ext)
-    except ValueError:
-        pass
-
 from .server.chat import refresh_available_models_cache
 from .server.chat import router as chat_router
-from .server.gemini import add_gemini_exception_handlers  # noqa: E402
-from .server.gemini import router as gemini_router  # noqa: E402
+from .server.gemini import add_gemini_exception_handlers
+from .server.gemini import router as gemini_router
 from .server.health import router as health_router
 from .server.media import router as media_router
 from .server.middleware import (
@@ -32,6 +18,19 @@ from .server.middleware import (
     cleanup_expired_media,
 )
 from .services import GeminiClientPool, LMDBConversationStore
+
+# Canonical audio MIME types: Python's platform mapping yields legacy "x-"
+# types (audio/x-wav, audio/x-aac, audio/x-flac) that Google's upload
+# endpoint does not classify as audio, so the attached file never reaches
+# the model as an audible attachment. Registered at import time, before any upload.
+for _ext, _mime in (
+    (".wav", "audio/wav"),
+    (".aac", "audio/aac"),
+    (".flac", "audio/flac"),
+    (".m4a", "audio/mp4"),
+):
+    with contextlib.suppress(ValueError):
+        mimetypes.add_type(_mime, _ext)
 
 RETENTION_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60  # Check every 6 hours
 
