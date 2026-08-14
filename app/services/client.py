@@ -4,8 +4,14 @@ from typing import Any
 
 import orjson
 from gemini_webapi import GeminiClient
-from gemini_webapi.constants import AccountStatus
-from gemini_webapi.types import AvailableModel
+from gemini_webapi.constants import GRPC, AccountStatus
+from gemini_webapi.types import (
+    AvailableModel,
+    Candidate,
+    ModelOutput,
+    RPCData,
+)
+from gemini_webapi.utils import extract_json_from_response, get_nested_value
 from loguru import logger
 
 from app.models import AppMessage
@@ -286,3 +292,55 @@ class GeminiClientWrapper(GeminiClient):
 
         conversation.append(add_tag("assistant", "", unclose=True))
         return "\n".join(conversation), files
+
+    async def fetch_last_model_turn(self, cid: str, limit: int = 10) -> ModelOutput | None:
+        """Fetch the newest completed model turn from the conversation-turns RPC.
+
+        Used for stream recovery: when a stream dies mid-response, Gemini still
+        finalizes the complete turn server-side. Returns the newest completed
+        model turn (full text + thoughts), or None when no finalized turn is
+        present yet — callers should poll. Extraction mirrors the dependency's
+        own read_chat shape: text at candidate[1][0], thoughts at [37][0][0],
+        completion indicator at [8][0] == 2.
+        """
+        resp = await self._batch_execute(
+            [
+                RPCData(
+                    rpcid=GRPC.LIST_CONVERSATION_TURNS,
+                    payload=orjson.dumps([cid, limit, None, 1, [1], [4], None, 1]).decode("utf-8"),
+                )
+            ]
+        )
+        parts = extract_json_from_response(resp.text)
+        for part in parts:
+            body = get_nested_value(part, [2])
+            if not body:
+                continue
+            try:
+                part_body = orjson.loads(body) if isinstance(body, str) else body
+            except orjson.JSONDecodeError:
+                continue
+            for turn in get_nested_value(part_body, [0]) or []:
+                rid = get_nested_value(turn, [0, 1], "")
+                candidates = get_nested_value(turn, [3, 0]) or []
+                for candidate_data in candidates:
+                    if not isinstance(candidate_data, list):
+                        continue
+                    rcid = get_nested_value(candidate_data, [0], "")
+                    if not rcid:
+                        continue
+                    if get_nested_value(candidate_data, [8, 0]) != 2:
+                        continue
+                    text = get_nested_value(candidate_data, [1, 0], "") or ""
+                    thoughts = get_nested_value(candidate_data, [37, 0, 0]) or ""
+                    if not (text or thoughts):
+                        continue
+                    candidate = Candidate(
+                        rcid=rcid,
+                        text=text,
+                        text_delta=text,
+                        thoughts=thoughts,
+                        thoughts_delta=thoughts,
+                    )
+                    return ModelOutput(metadata=[cid, rid], candidates=[candidate])
+        return None

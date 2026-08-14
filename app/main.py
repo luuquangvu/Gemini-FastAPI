@@ -1,11 +1,29 @@
 import asyncio
+import mimetypes
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from loguru import logger
 
+# Canonical audio MIME types: Python's platform mapping yields legacy "x-"
+# types (audio/x-wav, audio/x-aac, audio/x-flac) that Google's upload
+# endpoint does not classify as audio, so the attached file never reaches
+# the model as an audible attachment. Registered before any upload happens.
+for _ext, _mime in (
+    (".wav", "audio/wav"),
+    (".aac", "audio/aac"),
+    (".flac", "audio/flac"),
+    (".m4a", "audio/mp4"),
+):
+    try:
+        mimetypes.add_type(_mime, _ext)
+    except ValueError:
+        pass
+
 from .server.chat import refresh_available_models_cache
 from .server.chat import router as chat_router
+from .server.gemini import add_gemini_exception_handlers  # noqa: E402
+from .server.gemini import router as gemini_router  # noqa: E402
 from .server.health import router as health_router
 from .server.media import router as media_router
 from .server.middleware import (
@@ -106,9 +124,11 @@ def create_app() -> FastAPI:
 
     add_cors_middleware(app)
     add_exception_handler(app)
+    add_gemini_exception_handlers(app)
 
     app.include_router(health_router, tags=["Health"])
     app.include_router(chat_router, tags=["Chat"])
     app.include_router(media_router, tags=["Media"])
+    app.include_router(gemini_router, tags=["Gemini"])
 
     return app

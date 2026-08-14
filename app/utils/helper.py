@@ -1,9 +1,11 @@
 import base64
 import hashlib
 import html
+import ipaddress
 import mimetypes
 import re
 import reprlib
+import socket
 import struct
 import tempfile
 import unicodedata
@@ -29,7 +31,12 @@ from app.models import (
     StructuredOutputRequirement,
     ToolChoiceFunction,
     ToolChoiceTypes,
+    VideoGeneration,
 )
+from app.utils import g_config
+
+MAX_REMOTE_FETCH_BYTES = 20 * 1024 * 1024
+_HTML_SNIFF_PREFIXES = (b"<!doctype", b"<html", b"<script")
 
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
 
@@ -224,6 +231,55 @@ async def save_file_to_tempfile(
         return Path(tmp.name)
 
 
+def reject_unsafe_url(url: str) -> None:
+    """Reject remote URLs that could target internal/private networks (SSRF guard).
+
+    Allows only http/https. When `gemini.allow_private_url_fetch` is false (default),
+    any resolved address that is loopback, RFC1918-private, link-local, reserved,
+    multicast or unspecified is refused. DNS-rebinding TOCTOU between resolve and
+    fetch is a known residual; the opt-out knob exists for localhost-served images.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r} (only http/https allowed)")
+
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL must include a hostname")
+
+    if g_config.gemini.allow_private_url_fetch:
+        return
+
+    try:
+        addrinfos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise ValueError(f"Could not resolve host {host!r}: {e}") from e
+
+    for addrinfo in addrinfos:
+        ip = ipaddress.ip_address(addrinfo[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise ValueError(
+                f"Refusing to fetch private/reserved address {ip} for host {host!r} "
+                "(set gemini.allow_private_url_fetch=true to override)"
+            )
+
+
+def looks_like_html(content_type: str | None, body: bytes) -> bool:
+    """True when a fetched body is HTML — a classic SSRF/CSRF smuggling signal."""
+    ctype = (content_type or "").lower()
+    if "html" in ctype:
+        return True
+    head = body[:2048].lstrip().lower()
+    return any(head.startswith(prefix) for prefix in _HTML_SNIFF_PREFIXES)
+
+
 async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
     """Download content from a URL and save to a temporary file."""
     data: bytes | None = None
@@ -236,16 +292,25 @@ async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
             f".{mime_type.split('/')[1]}" if "/" in mime_type else ".bin"
         )
     else:
+        reject_unsafe_url(url)
         async with requests.AsyncSession(
-            impersonate="chrome", allow_redirects=CurlFollow.SAFE, http_version=CurlHttpVersion.NONE
+            impersonate="chrome",
+            allow_redirects=CurlFollow.SAFE,
+            http_version=CurlHttpVersion.NONE,
+            timeout=g_config.gemini.url_fetch_timeout,
         ) as client:
             resp = await client.get(url)
             resp.raise_for_status()
-            data = resp.content
-            if content_type := resp.headers.get("content-type"):
-                suffix = mimetypes.guess_extension(content_type.split(";")[0].strip())
-            if not suffix:
-                suffix = Path(urlparse(url).path).suffix or ".bin"
+            data = await resp.acontent()
+            content_type = resp.headers.get("content-type")
+        if len(data) > MAX_REMOTE_FETCH_BYTES:
+            raise ValueError(f"Remote fetch exceeded {MAX_REMOTE_FETCH_BYTES} bytes: {url}")
+        if looks_like_html(content_type, data):
+            raise ValueError(f"Refusing to save fetched content that looks like HTML: {url}")
+        if content_type:
+            suffix = mimetypes.guess_extension(content_type.split(";")[0].strip())
+        if not suffix:
+            suffix = Path(urlparse(url).path).suffix or ".bin"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempdir) as tmp:
         tmp.write(data)
@@ -761,6 +826,32 @@ def build_image_generation_instruction(
     if has_forced_choice:
         instructions.append(
             "Image generation was explicitly requested. You MUST return at least one generated image. Any response without an image will be treated as a failure."
+        )
+
+    return "\n\n".join(instructions)
+
+
+def build_video_generation_instruction(
+    tools: list[VideoGeneration] | None,
+    tool_choice: ToolChoiceFunction | None,
+) -> str | None:
+    """Construct explicit guidance so Gemini emits a video when requested."""
+    has_forced_choice = tool_choice is not None and tool_choice.type == "video_generation"
+    primary = tools[0] if tools else None
+
+    if not has_forced_choice and primary is None:
+        return None
+
+    instructions: list[str] = [
+        "VIDEO GENERATION ENABLED: When a video is requested, you MUST return a real generated video directly.",
+        "1. For new requests, generate a new video matching the description immediately.",
+        "2. CRITICAL: Provide ZERO text explanation, prologue, or apologies. Do not describe the creation process.",
+        "3. NEVER send placeholder text or descriptions like 'Generating video...' without an actual video attachment.",
+    ]
+
+    if has_forced_choice:
+        instructions.append(
+            "Video generation was explicitly requested. You MUST return at least one generated video. Any response without a video will be treated as a failure."
         )
 
     return "\n\n".join(instructions)

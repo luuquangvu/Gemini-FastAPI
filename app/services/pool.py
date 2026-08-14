@@ -32,14 +32,23 @@ class GeminiClientPool(metaclass=Singleton):
             self._round_robin.append(client)
             self._restart_locks[c.id] = asyncio.Lock()
 
+    async def _init_one(self, client: GeminiClientWrapper) -> bool:
+        """Initialize a single client; returns True on success."""
+        return await self._init_attempt(client)
+
+    async def _init_attempt(self, client: GeminiClientWrapper) -> bool:
+        """Run library init; returns True on success."""
+        try:
+            await client.init()
+            return True
+        except Exception:
+            return False
+
     async def init(self) -> None:
         """Initialize all clients in the pool with staggered start times."""
         clients_to_init = [c for c in self._clients if not c.running()]
         for i, client in enumerate(clients_to_init):
-            try:
-                await client.init()
-            except Exception:
-                logger.error(f"Failed to initialize client {client.id}")
+            await self._init_one(client)
 
             if i < len(clients_to_init) - 1:
                 delay = random.uniform(5, 30)
@@ -112,13 +121,10 @@ class GeminiClientPool(metaclass=Singleton):
             if client.running():
                 return True
 
-            try:
-                await client.init()
+            if await self._init_attempt(client):
                 logger.info(f"Restarted Gemini client {client.id} after it stopped.")
                 return True
-            except Exception:
-                logger.exception(f"Failed to restart Gemini client {client.id}")
-                return False
+            return False
 
     @property
     def clients(self) -> list[GeminiClientWrapper]:

@@ -3,6 +3,7 @@ import base64
 import hashlib
 import io
 import reprlib
+import time
 import uuid
 from collections.abc import AsyncGenerator, Sequence
 from datetime import UTC, datetime
@@ -684,7 +685,7 @@ def _resolve_model_name(pool: GeminiClientPool, name: str) -> str:
             continue
 
         try:
-            return client.resolve_model(name).model_name
+            return client._resolve_model_by_name(name).model_name
         except ValueError:
             continue
 
@@ -1177,6 +1178,42 @@ async def _process_media_item(
 # --- Response Builders & Streaming ---
 
 
+async def _recover_stream_output(
+    client_wrapper: GeminiClientWrapper,
+    session: ChatSession,
+    prev_rcid: str,
+    recover_timeout: int,
+) -> ModelOutput | None:
+    """Recover the full model turn from the conversation-turns RPC after a truncated stream.
+
+    Gemini finalizes the turn server-side even when the stream dies mid-response.
+    Polls until a completed turn with a NEW rcid appears (rec_rcid != prev_rcid,
+    parity with the pinned dependency's own recovery gate), or the timeout
+    elapses.
+    """
+    cid = getattr(session, "cid", "") or ""
+    if not cid or recover_timeout <= 0:
+        return None
+    deadline = time.monotonic() + recover_timeout
+    while time.monotonic() < deadline:
+        try:
+            recovered = await client_wrapper.fetch_last_model_turn(cid)
+        except Exception as e:
+            logger.warning(f"[Recovery] Turns RPC failed for {cid}: {type(e).__name__}: {e}")
+            break
+        if recovered is not None:
+            rec_rcid = recovered.rcid or ""
+            if rec_rcid and (not prev_rcid or rec_rcid != prev_rcid):
+                logger.info(f"[Recovery] Full turn recovered for {cid} (rcid {rec_rcid})")
+                return recovered
+            logger.debug(
+                f"[Recovery] Turn not ready for {cid} (rcid {rec_rcid!r}, prev {prev_rcid!r}); waiting..."
+            )
+        await asyncio.sleep(10)
+    logger.warning(f"[Recovery] Timed out after {recover_timeout}s for {cid}")
+    return None
+
+
 def _create_real_streaming_response(
     resp_or_stream: AsyncGenerator[ModelOutput] | ModelOutput,
     completion_id: str,
@@ -1220,6 +1257,7 @@ def _create_real_streaming_response(
             }
             return f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
 
+        prev_rcid = getattr(session, "rcid", "") or ""
         try:
             if hasattr(resp_or_stream, "__aiter__"):
                 generator = cast(AsyncGenerator[ModelOutput], resp_or_stream)
@@ -1262,8 +1300,24 @@ def _create_real_streaming_response(
                         media_tasks.append(asyncio.create_task(_process_media_item(m)))
         except Exception as e:
             logger.error(f"Error during streaming: {e}")
-            yield f"data: {orjson.dumps({'error': {'message': f'Streaming error occurred: {e}', 'type': 'server_error', 'param': None, 'code': None}}).decode('utf-8')}\n\n"
-            return
+            recovered = await _recover_stream_output(
+                client_wrapper, session, prev_rcid, g_config.gemini.recovery_timeout
+            )
+            if recovered is None:
+                yield f"data: {orjson.dumps({'error': {'message': f'Streaming error occurred: {e}', 'type': 'server_error', 'param': None, 'code': None}}).decode('utf-8')}\n\n"
+                return
+            logger.info(f"Stream truncated; recovered full turn text for {session.cid}.")
+            rec_thoughts = recovered.thoughts or ""
+            if rec_thoughts.startswith(full_thoughts) and len(rec_thoughts) > len(full_thoughts):
+                t_tail = rec_thoughts[len(full_thoughts) :]
+                full_thoughts = rec_thoughts
+                yield make_chunk({"delta": {"reasoning_content": t_tail}, "finish_reason": None})
+            rec_text = recovered.text or ""
+            if rec_text.startswith(full_text) and len(rec_text) > len(full_text):
+                text_tail = rec_text[len(full_text) :]
+                full_text = rec_text
+                if not structured_requirement and (visible_tail := suppressor.process(text_tail)):
+                    yield make_chunk({"delta": {"content": visible_tail}, "finish_reason": None})
 
         if all_outputs:
             final_chunk = all_outputs[-1]
