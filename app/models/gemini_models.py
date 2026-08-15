@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -64,7 +64,7 @@ class GeminiPart(BaseModel):
 class GeminiContent(BaseModel):
     """一条消息内容(用户 / 模型 / 函数角色)。"""
 
-    role: str | None = None  # "user" | "model" | "function"
+    role: Literal["user", "model", "function"] | None = None
     parts: list[GeminiPart] = Field(default_factory=list)
 
 
@@ -91,7 +91,8 @@ class GeminiTool(BaseModel):
 class GeminiFunctionCallingConfig(BaseModel):
     """函数调用配置。"""
 
-    mode: str = "AUTO"  # AUTO | NONE | ANY
+    mode: Literal["AUTO", "NONE", "ANY"] = "AUTO"
+    allowedFunctionNames: list[str] | None = None
 
 
 class GeminiToolConfig(BaseModel):

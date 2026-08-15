@@ -32,11 +32,13 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import orjson
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from gemini_webapi import ModelOutput
 from loguru import logger
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.models import (
     AppContentItem,
@@ -85,13 +87,24 @@ from app.utils.helper import calculate_usage, normalize_llm_text, process_llm_ou
 router = APIRouter()
 
 
-def add_gemini_exception_handlers(app):
-    """Register the Gemini-route validation-error handler (scoped to /v1beta/).
+def add_gemini_exception_handlers(app: FastAPI) -> None:
+    """Register Google-style HTTP and validation errors for /v1beta routes."""
 
-    Our main.py registers no custom RequestValidationError handler, so for
-    non-/v1beta paths this reproduces the FastAPI default shape {"detail": [...]}
-    exactly — existing /v1 endpoint behavior is preserved.
-    """
+    @app.exception_handler(StarletteHTTPException)
+    async def gemini_http_exception_handler(request: Request, exc: StarletteHTTPException):
+        if not request.url.path.startswith("/v1beta/"):
+            return await http_exception_handler(request, exc)
+
+        grpc_status = {
+            400: "INVALID_ARGUMENT",
+            401: "UNAUTHENTICATED",
+            403: "PERMISSION_DENIED",
+            404: "NOT_FOUND",
+            429: "RESOURCE_EXHAUSTED",
+            503: "UNAVAILABLE",
+        }.get(exc.status_code, "INTERNAL")
+        err = _to_gemini_error(exc.status_code, str(exc.detail), grpc_status)
+        return JSONResponse(status_code=exc.status_code, content=err.model_dump(mode="json"))
 
     @app.exception_handler(RequestValidationError)
     async def gemini_validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -106,10 +119,7 @@ def add_gemini_exception_handlers(app):
                 )
             )
             return JSONResponse(status_code=400, content=err.model_dump(mode="json"))
-        return JSONResponse(
-            status_code=422,
-            content={"detail": exc.errors()},
-        )
+        return await request_validation_exception_handler(request, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -137,8 +147,7 @@ def _gemini_contents_to_messages(
             if hasattr(system_instruction, "parts")
             else (system_instruction.get("parts") or [])
         )
-        sys_texts = [p.text for p in sys_parts if p.text]
-        if sys_texts:
+        if sys_texts := [p.text for p in sys_parts if p.text]:
             messages.append(AppMessage(role="system", content="\n".join(sys_texts)))
 
     # Track the previous assistant message's tool_call IDs for functionResponse mapping
@@ -253,16 +262,15 @@ def _gemini_tools_to_internal(
 
     internal_tools: list[FunctionTool] = []
     for tool in tools:
-        for decl in tool.functionDeclarations or []:
-            internal_tools.append(
-                FunctionTool(
-                    type="function",
-                    name=decl.name,
-                    description=decl.description,
-                    parameters=decl.parameters,
-                )
+        internal_tools.extend(
+            FunctionTool(
+                type="function",
+                name=decl.name,
+                description=decl.description,
+                parameters=decl.parameters,
             )
-
+            for decl in tool.functionDeclarations or []
+        )
     tool_choice: Literal["none", "auto", "required"] | ToolChoiceFunction | None = None
     if tool_config and tool_config.functionCallingConfig:
         mode = tool_config.functionCallingConfig.mode.upper()
@@ -340,11 +348,26 @@ def _to_gemini_error(status_code: int, message: str, grpc_status: str) -> Gemini
     )
 
 
+def _validate_gemini_request(request: GeminiGenerateContentRequest) -> str | None:
+    """Reject only structures that would otherwise be silently dropped from the prompt."""
+    if not request.contents:
+        return "contents is required and cannot be empty."
+
+    for content in request.contents:
+        if not content.parts:
+            return "Each content entry must contain at least one part."
+        if any(part.fileData is not None for part in content.parts):
+            return "fileData is not supported; provide the data using inlineData instead."
+    if request.systemInstruction and any(
+        part.fileData is not None for part in request.systemInstruction.parts
+    ):
+        return "fileData is not supported; provide the data using inlineData instead."
+    return None
+
+
 def _strip_model_prefix(model: str) -> str:
     """Strip a leading 'models/' prefix if present."""
-    if model.startswith("models/"):
-        return model[len("models/") :]
-    return model
+    return model[len("models/") :] if model.startswith("models/") else model
 
 
 def _model_data_to_gemini_info(model_data: Any) -> GeminiModelInfo:
@@ -416,8 +439,8 @@ async def gemini_generate_content(
         err = _to_gemini_error(400, str(exc), "INVALID_ARGUMENT")
         return JSONResponse(status_code=400, content=err.model_dump(mode="json"))
 
-    if not request.contents:
-        err = _to_gemini_error(400, "contents is required and cannot be empty.", "INVALID_ARGUMENT")
+    if validation_error := _validate_gemini_request(request):
+        err = _to_gemini_error(400, validation_error, "INVALID_ARGUMENT")
         return JSONResponse(status_code=400, content=err.model_dump(mode="json"))
 
     messages = _gemini_contents_to_messages(request.contents, request.systemInstruction)
@@ -555,8 +578,8 @@ async def gemini_stream_generate_content(
         err = _to_gemini_error(400, str(exc), "INVALID_ARGUMENT")
         return JSONResponse(status_code=400, content=err.model_dump(mode="json"))
 
-    if not request.contents:
-        err = _to_gemini_error(400, "contents is required and cannot be empty.", "INVALID_ARGUMENT")
+    if validation_error := _validate_gemini_request(request):
+        err = _to_gemini_error(400, validation_error, "INVALID_ARGUMENT")
         return JSONResponse(status_code=400, content=err.model_dump(mode="json"))
 
     messages = _gemini_contents_to_messages(request.contents, request.systemInstruction)

@@ -126,14 +126,6 @@ class GeminiConfig(BaseModel):
         le=120,
         description="Timeout in seconds for server-side URL image fetches",
     )
-    recovery_timeout: int = Field(
-        default=60,
-        ge=0,
-        description=(
-            "Seconds to poll the conversation-turns RPC for the finalized turn after a "
-            "truncated stream (0 disables recovery)"
-        ),
-    )
 
 
 class CORSConfig(BaseModel):

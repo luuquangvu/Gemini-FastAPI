@@ -35,7 +35,6 @@ from app.models import (
 from app.utils import g_config
 
 MAX_REMOTE_FETCH_BYTES = 20 * 1024 * 1024
-_HTML_SNIFF_PREFIXES = (b"<!doctype", b"<html", b"<script")
 
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
 
@@ -256,33 +255,18 @@ def reject_unsafe_url(url: str) -> None:
 
     for addrinfo in addrinfos:
         ip = ipaddress.ip_address(addrinfo[4][0])
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
-        ):
+        # `is_global` covers private, loopback, link-local, reserved, unspecified,
+        # documentation and shared-address ranges. Multicast is the exception:
+        # ipaddress reports it as global even though it is not a valid fetch target.
+        if not ip.is_global or ip.is_multicast:
             raise ValueError(
                 f"Refusing to fetch private/reserved address {ip} for host {host!r} "
                 "(set gemini.allow_private_url_fetch=true to override)"
             )
 
 
-def looks_like_html(content_type: str | None, body: bytes) -> bool:
-    """True when a fetched body is HTML — a classic SSRF/CSRF smuggling signal."""
-    ctype = (content_type or "").lower()
-    if "html" in ctype:
-        return True
-    head = body[:2048].lstrip().lower()
-    return any(head.startswith(prefix) for prefix in _HTML_SNIFF_PREFIXES)
-
-
 async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
     """Download content from a URL and save to a temporary file."""
-    data: bytes | None = None
-    suffix: str | None = None
     if url.startswith("data:"):
         metadata_part = url.split(",")[0]
         mime_type = metadata_part.split(":")[1].split(";")[0]
@@ -290,30 +274,52 @@ async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
         suffix = mimetypes.guess_extension(mime_type) or (
             f".{mime_type.split('/')[1]}" if "/" in mime_type else ".bin"
         )
-    else:
-        reject_unsafe_url(url)
-        async with requests.AsyncSession(
-            impersonate="chrome",
-            allow_redirects=CurlFollow.SAFE,
-            http_version=CurlHttpVersion.NONE,
-            timeout=g_config.gemini.url_fetch_timeout,
-        ) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = await resp.acontent()
-            content_type = resp.headers.get("content-type")
-        if len(data) > MAX_REMOTE_FETCH_BYTES:
-            raise ValueError(f"Remote fetch exceeded {MAX_REMOTE_FETCH_BYTES} bytes: {url}")
-        if looks_like_html(content_type, data):
-            raise ValueError(f"Refusing to save fetched content that looks like HTML: {url}")
-        if content_type:
-            suffix = mimetypes.guess_extension(content_type.split(";")[0].strip())
-        if not suffix:
-            suffix = Path(urlparse(url).path).suffix or ".bin"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempdir) as tmp:
+            tmp.write(data)
+            return Path(tmp.name)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempdir) as tmp:
-        tmp.write(data)
-        return Path(tmp.name)
+    reject_unsafe_url(url)
+    url_suffix = Path(urlparse(url).path).suffix or ".bin"
+    downloaded = 0
+    temp_path: Path | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=url_suffix, dir=tempdir) as tmp:
+            temp_path = Path(tmp.name)
+
+            def receive_chunk(chunk: bytes) -> None:
+                nonlocal downloaded
+                downloaded += len(chunk)
+                if downloaded > MAX_REMOTE_FETCH_BYTES:
+                    raise ValueError(f"Remote fetch exceeded {MAX_REMOTE_FETCH_BYTES} bytes: {url}")
+                tmp.write(chunk)
+
+            async with requests.AsyncSession(
+                impersonate="chrome",
+                allow_redirects=CurlFollow.SAFE,
+                http_version=CurlHttpVersion.NONE,
+                timeout=g_config.gemini.url_fetch_timeout,
+            ) as client:
+                resp = await client.get(url, content_callback=receive_chunk)
+                resp.raise_for_status()
+                content_type = resp.headers.get("content-type")
+
+            suffix = (
+                mimetypes.guess_extension(content_type.split(";")[0].strip())
+                if content_type
+                else None
+            )
+    except Exception:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
+
+    assert temp_path is not None
+    if suffix and suffix != temp_path.suffix:
+        final_path = temp_path.with_suffix(suffix)
+        temp_path.rename(final_path)
+        return final_path
+    return temp_path
 
 
 def strip_tagged_blocks(text: str) -> str:
