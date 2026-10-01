@@ -8,6 +8,14 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 COPY pyproject.toml uv.lock ./
 
+RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,id=aptlib,sharing=locked \
+    <<EOF
+set -eux
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates git
+EOF
+
 RUN --mount=type=cache,target=/root/.cache/uv <<EOF
 set -eux
 uv sync --locked --no-install-project --no-default-groups

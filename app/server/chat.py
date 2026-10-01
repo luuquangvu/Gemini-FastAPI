@@ -824,11 +824,7 @@ def _convert_instructions_to_app_messages(
 
     instruction_messages: list[AppMessage] = []
     for instruction in instructions:
-        if instruction.type and instruction.type != "message":
-            continue
-
         role = normalize_app_message_role(instruction.role)
-
         content = instruction.content
         if isinstance(content, str):
             instruction_messages.append(AppMessage(role=role, content=content))
