@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 import orjson
 import regex
-from curl_cffi import CurlFollow, CurlHttpVersion, requests
+from curl_cffi import CurlHttpVersion, requests
 from jsonschema import SchemaError, ValidationError, validators
 from jsonschema.validators import validator_for
 from loguru import logger
@@ -577,7 +577,7 @@ async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
 
             async with requests.AsyncSession(
                 impersonate="chrome",
-                allow_redirects=CurlFollow.SAFE,
+                allow_redirects=True,
                 http_version=CurlHttpVersion.NONE,
                 timeout=g_config.gemini.url_fetch_timeout,
             ) as client:

@@ -92,6 +92,10 @@ python run.py
   - **工具调用**: 支持通过 `tools` 参数进行函数调用 (Function Calling)。
   - **结构化输出**: 支持 `response_format` 的全部模式。`json_schema` 会在服务器端按所给
     Schema 验证；`json_object`（JSON 模式）只要求回复能解析为 JSON；`text` 为默认值，不作限制。
+- **`POST /v1/images/generations`**: 兼容 OpenAI 的图片生成接口。
+  - **提示词与比例**: 支持自然语言生图提示词，通过 `size` 支持比例设置（如 `1:1`, `16:9`, `9:16`, `1024x1024` 等）。
+  - **输出格式**: 支持返回 `b64_json` 或携带令牌验证的 `url`。
+  - **画质选择**: 支持通过 `quality` 设置分辨率/画质（`1k`, `2k`, `4k`, `auto`）。
 
 ### 高级接口
 
