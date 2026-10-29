@@ -94,6 +94,11 @@ level so they do not prevent an otherwise representable request from running.
   - **Structured Output**: Supports every `response_format` mode. `json_schema` is validated
     server-side against the supplied schema; `json_object` (JSON mode) only requires that the
     reply parses as JSON; `text` is the default and imposes nothing.
+- **`POST /v1/images/generations`**: Image generation interface compatible with OpenAI clients.
+  - **Model**: Omit `model` to use each Gemini account's own default model; naming a model unavailable on any client returns `400` instead of silently switching.
+  - **Prompt & Aspect Ratio**: Supports natural image generation prompts and aspect ratio configuration via `size` (e.g. `1:1`, `16:9`, `9:16`, `1024x1024`, etc.).
+  - **Output Formats**: Returns generated images as `b64_json` or token-authenticated `url`.
+  - **Quality**: Supports resolution/quality selection (`1k`, `2k`, `4k`, `auto`).
 
 ### Advanced Endpoints
 
