@@ -9,7 +9,7 @@ on:
       - "config/**"
       - "pyproject.toml"
       - "uv.lock"
-      - "Dockerfile"
+      - "docker/**"
       - "run.py"
       - ".github/workflows/docker.yaml"
   workflow_dispatch:
@@ -70,6 +70,7 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          file: docker/Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true

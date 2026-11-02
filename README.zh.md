@@ -141,6 +141,18 @@ Gemini 网页端未暴露的生成控制项，例如 `temperature`、`top_p`、�
 
 ## Docker 部署
 
+> [!NOTE]
+> 本仓库（fork）也发布了自己的镜像：`ghcr.io/luuquangvu/gemini-fastapi:latest`。
+> 如需使用本仓库的改动，请将下方示例中的上游镜像替换为该镜像。
+
+### 本地构建镜像
+
+容器相关文件位于 [`docker/`](docker/)。请在仓库根目录执行构建，以确保应用源码仍位于构建上下文中：
+
+```bash
+docker build -f docker/Dockerfile -t gemini-fastapi .
+```
+
 ### 直接运行
 
 ```bash
@@ -195,6 +207,15 @@ docker compose up -d
 > [!IMPORTANT]
 > 请务必挂载 `/app/data` 卷以保证对话数据在容器重启后持久化。
 > 同时挂载 `/app/cache`（或与 `GEMINI_COOKIE_PATH` 对应的目录）以保存刷新后的 Cookie，这样在容器重建/重启后无需频繁重新认证。
+
+### 存储与权限
+
+容器以非特权用户 `10000:10000` 运行应用。启动时，入口脚本会根据 `CONFIG_*` 环境变量覆盖或
+`config/config.yaml` 解析存储位置，然后创建 `storage.path`、`storage.media_path` 与
+`GEMINI_COOKIE_PATH` 目录，并将其所有者设置为该用户。
+
+若使用显式的 `--user` 启动容器，这些挂载目录必须已对该用户可写。否则服务器会以降级模式启动，
+并由 `/health` 报告存储不可用，直到权限修复为止。
 
 ## 配置说明
 

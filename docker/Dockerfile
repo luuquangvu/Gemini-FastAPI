@@ -51,8 +51,9 @@ COPY --from=builder /app/.venv .venv/
 COPY app/ app/
 COPY config/ config/
 COPY run.py run.py
-COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-COPY --chmod=0755 docker-healthcheck.sh /usr/local/bin/docker-healthcheck.sh
+COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --chmod=0755 docker/healthcheck.sh /usr/local/bin/docker-healthcheck.sh
+COPY --chmod=0755 docker/prepare-dirs.py /usr/local/bin/docker-prepare-dirs.py
 
 EXPOSE 8000
 

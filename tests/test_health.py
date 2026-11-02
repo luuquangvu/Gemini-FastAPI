@@ -50,6 +50,23 @@ def test_guest_mode_controls_client_health_status(
     assert result.ok is expected_ok
 
 
+def test_storage_initialization_failure_reports_unavailable(monkeypatch):
+    """A store that cannot be opened must surface as 503, not an uncaught error."""
+    monkeypatch.setattr(health, "GeminiClientPool", lambda: _Pool({"healthy": True}))
+
+    def _unavailable():
+        raise OSError("data/lmdb: Permission denied")
+
+    monkeypatch.setattr(health, "LMDBConversationStore", _unavailable)
+    response = Response()
+
+    result = asyncio.run(health.health_check(response))
+
+    assert response.status_code == 503
+    assert result.ok is False
+    assert result.error == "LMDB conversation store unavailable"
+
+
 def test_guest_mode_defaults_to_adaptive():
     """Verify default guest mode setting is adaptive."""
     config = GeminiConfig(clients=[], auto_refresh=True, verbose=True)

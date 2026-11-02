@@ -149,6 +149,18 @@ narrows the tool list only in the `ANY` and `VALIDATED` modes that act on it.
 
 ## Docker Deployment
 
+> [!NOTE]
+> This fork publishes its own image at `ghcr.io/luuquangvu/gemini-fastapi:latest`. Use it
+> instead of the upstream image shown in the examples below if you want this fork's changes.
+
+### Build the Image Locally
+
+Container assets live in [`docker/`](docker/). Build from the repository root so the application sources remain in the build context:
+
+```bash
+docker build -f docker/Dockerfile -t gemini-fastapi .
+```
+
 ### Run with Options
 
 ```bash
@@ -203,6 +215,17 @@ docker compose up -d
 > [!IMPORTANT]
 > Make sure to mount the `/app/data` volume to persist conversation data between container restarts.
 > Also mount `/app/cache` so refreshed cookies (including rotated 1PSIDTS values) survive container rebuilds/recreates without re-auth.
+
+### Storage and Permissions
+
+The container runs the application as the unprivileged `10000:10000` user. On startup, the
+entrypoint resolves the configured storage locations from the `CONFIG_*` environment overrides or
+`config/config.yaml`, then creates the `storage.path`, `storage.media_path`, and
+`GEMINI_COOKIE_PATH` directories and assigns them to that user.
+
+If you start the container with an explicit `--user`, those bind mounts must already be writable by
+that user. Otherwise the server starts in degraded mode and `/health` reports storage as
+unavailable until the permissions are fixed.
 
 ## Configuration
 

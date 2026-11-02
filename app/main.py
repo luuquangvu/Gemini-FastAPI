@@ -51,7 +51,14 @@ def _get_cleanup_interval() -> int:
 
 async def _run_retention_cleanup(stop_event: asyncio.Event) -> None:
     """Periodically enforce LMDB retention policy and remote chat deletion."""
-    store = LMDBConversationStore()
+    try:
+        store = LMDBConversationStore()
+    except Exception:
+        logger.exception(
+            "LMDB storage is unavailable; disabling the retention scheduler. "
+            "The server will keep running so /health can report the failure."
+        )
+        return
     pool = GeminiClientPool()
 
     if (

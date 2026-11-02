@@ -15,9 +15,13 @@ router = APIRouter()
 async def health_check(response: Response):
     """Check health status of Gemini clients and LMDB storage."""
     pool = GeminiClientPool()
-    db = LMDBConversationStore()
     client_status = pool.status()
-    stat = db.stats()
+    try:
+        db = LMDBConversationStore()
+        stat = db.stats()
+    except Exception:
+        logger.exception("LMDB conversation store unavailable")
+        stat = {}
 
     if not all(client_status.values()):
         down_clients = [client_id for client_id, status in client_status.items() if not status]

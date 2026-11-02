@@ -1,6 +1,7 @@
 """LMDB conversation store for persisting and retrieving chat sessions."""
 
 import hashlib
+import os
 import string
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager, suppress
@@ -237,7 +238,10 @@ class LMDBConversationStore(metaclass=Singleton):
             )
             logger.info(f"LMDB environment initialized at {self.db_path}")
         except Error as e:
-            logger.error(f"Failed to initialize LMDB environment: {e}")
+            logger.error(
+                f"Failed to initialize LMDB environment at {self.db_path.resolve()} "
+                f"(uid={os.geteuid()}, gid={os.getegid()}): {e}"
+            )
             raise
 
     @contextmanager
