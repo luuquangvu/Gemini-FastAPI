@@ -225,12 +225,18 @@ def test_conforming_output_is_canonicalized():
         {"type": "OBJECT"},  # foreign dialect that slipped through
     ],
 )
-def test_unusable_schemas_leave_the_reply_unverified_rather_than_failing_it(schema):
+def test_unusable_schemas_leave_the_reply_unverified_rather_than_failing_it(schema, monkeypatch):
     """Failing to run the check is our problem, not the model's, so it cannot be a violation."""
+    fetched = []
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: fetched.append(args))
+    started = time.perf_counter()
     assert canonicalize_structured_output('{"a": 1}', _requirement(schema)) == '{"a":1}'
+    assert time.perf_counter() - started < 2.0
     # And it must not reach the caller as an error, even under strict.
     _, visible, _, _ = process_llm_output(None, '{"a": 1}', _requirement(schema))
     assert visible == '{"a":1}'
+    # A client-supplied reference must never turn into a server-side request.
+    assert not fetched
 
 
 def test_json_mode_requires_only_that_the_payload_parses():

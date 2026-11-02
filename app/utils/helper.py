@@ -19,6 +19,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import orjson
+import referencing
 import regex
 from curl_cffi import CurlHttpVersion, requests
 from jsonschema import SchemaError, ValidationError, validators
@@ -322,6 +323,9 @@ class SchemaEvaluationTimeoutError(ValueError):
 SCHEMA_REGEX_BUDGET_SECONDS: float = g_config.server.schema_validation_budget_seconds
 _schema_regex_deadline: ContextVar[float | None] = ContextVar("schema_regex_deadline", default=None)
 _bounded_validator_classes: dict[type[Any], type[Any]] = {}
+# jsonschema's default registry resolves remote `$ref`s over the network. A client-supplied schema
+# must never make the server fetch a URL (SSRF, request stalls), so only bundled specs are used.
+_SCHEMA_REGISTRY = referencing.Registry()
 
 
 def _bounded_regex_search(pattern: str, value: str) -> bool:
@@ -391,7 +395,7 @@ def _bounded_validator_for(schema: dict[str, Any]):
             },
         )
         _bounded_validator_classes[base] = bounded
-    return bounded(schema)
+    return bounded(schema, registry=_SCHEMA_REGISTRY)
 
 
 def validate_json_schema(schema: dict[str, Any]) -> None:

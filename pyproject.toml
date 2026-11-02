@@ -13,7 +13,8 @@ dependencies = [
   "lmdb>=3.0.0",
   "loguru>=0.7.3",
   "orjson>=3.11.9",
-  "pydantic-settings[yaml]>=2.16.1",
+  "pydantic-settings[yaml]>=2.16.2",
+  "referencing>=0.37.0",
   "regex>=2026.9.29",
   "uvicorn>=0.54.0",
   "uvloop>=0.23.0; sys_platform != 'win32'",
@@ -23,7 +24,17 @@ dependencies = [
 Repository = "https://github.com/Nativu5/Gemini-FastAPI"
 
 [project.optional-dependencies]
-dev = ["httpx2", "prek", "pyright", "pytest", "ruff", "ty"]
+dev = [
+  "httpx2",
+  "prek",
+  "pyright",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-timeout",
+  "pytest-xdist",
+  "ruff",
+  "ty"
+]
 
 [dependency-groups]
 dev = ["gemini-fastapi[dev]"]
@@ -34,23 +45,23 @@ target-version = "py314"
 
 [tool.ruff.lint]
 select = [
-  "B",   # flake8-bugbear
+  "B",  # flake8-bugbear
   "C4",  # flake8-comprehensions
-  "D",   # pydocstyle
-  "E",   # pycodestyle errors
-  "F",   # pyflakes
-  "G",   # flake8-logging-format
-  "I",   # isort
-  "LOG", # flake8-logging
-  "N",   # pep8-naming
-  "PIE", # flake8-pie
+  "D",  # pydocstyle
+  "E",  # pycodestyle errors
+  "F",  # pyflakes
+  "G",  # flake8-logging-format
+  "I",  # isort
+  "LOG",  # flake8-logging
+  "N",  # pep8-naming
+  "PIE",  # flake8-pie
   "PT",  # flake8-pytest-style
-  "RET", # flake8-return
-  "RUF", # ruff-specific rules
-  "SIM", # flake8-simplify
-  "TID", # flake8-tidy-imports
+  "RET",  # flake8-return
+  "RUF",  # ruff-specific rules
+  "SIM",  # flake8-simplify
+  "TID",  # flake8-tidy-imports
   "UP",  # pyupgrade
-  "W",   # pycodestyle warnings
+  "W",  # pycodestyle warnings
 ]
 
 [tool.ruff.lint.pydocstyle]
@@ -72,8 +83,16 @@ typeCheckingMode = "standard"
 reportUnreachable = "warning"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["."]
+testpaths = ["tests"]
+addopts = [
+  "-n",
+  "auto",
+  "--quiet",
+  "--timeout=60",
+]
 
 [tool.uv.sources]
 gemini-webapi = { git = "https://github.com/HanaokaYuzu/Gemini-API.git" }

@@ -15,7 +15,6 @@ set -eux
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates git
 EOF
-
 RUN --mount=type=cache,target=/root/.cache/uv <<EOF
 set -eux
 uv sync --locked --no-install-project --no-default-groups
@@ -23,6 +22,9 @@ EOF
 
 FROM python:3.14-slim-trixie AS runtime
 
+# The entrypoint starts as root only to fix ownership of data/cache bind mounts,
+# then always drops to the fixed unprivileged account (10000:10000) before
+# exec'ing the application. It never adopts the host mount owner.
 # tally ignore=hadolint/DL3002
 USER root
 
@@ -34,7 +36,11 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
 set -eux
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates tini
+groupadd --gid 10000 app
+useradd --uid 10000 --gid app --home-dir /app --no-create-home \
+	--shell /usr/sbin/nologin app
 mkdir -p /app/cache /app/data
+chown app:app /app/cache /app/data
 EOF
 
 ENV PATH="/app/.venv/bin:$PATH" \
@@ -45,6 +51,8 @@ COPY --from=builder /app/.venv .venv/
 COPY app/ app/
 COPY config/ config/
 COPY run.py run.py
+COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --chmod=0755 docker-healthcheck.sh /usr/local/bin/docker-healthcheck.sh
 
 EXPOSE 8000
 
@@ -52,8 +60,8 @@ HEALTHCHECK --interval=30s \
     --timeout=10s \
     --start-period=10m \
     --retries=3 \
-    CMD ["python", "-c", "import urllib.request; from app.utils import g_config; urllib.request.urlopen(f'http://127.0.0.1:{g_config.server.port}/health', timeout=5).close()"]
+    CMD ["/usr/local/bin/docker-healthcheck.sh"]
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
 
 CMD ["python", "run.py"]
